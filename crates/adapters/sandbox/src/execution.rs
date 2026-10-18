@@ -593,6 +593,11 @@ impl ExecutionClient for SandboxExecutionClient {
         self.config.oms_type
     }
 
+    // Position reports are always empty, so an absent report is not evidence of a flat position
+    fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
+        false
+    }
+
     fn settles_contract_expirations(&self) -> bool {
         true
     }
@@ -1436,23 +1441,7 @@ impl SandboxInner {
 
         self.ensure_matching_engine(&instrument);
 
-        let cache = self.cache.borrow();
-
-        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-            if let Some(quote) = cache.quote(&instrument_id)
-                && check_quote_or_drop("cached quote tick", quote, &instrument)
-            {
-                engine.process_quote_tick(quote);
-            }
-
-            if self.config.trade_execution
-                && let Some(trade) = cache.trade(&instrument_id)
-                && check_trade_or_drop("cached trade tick", trade, &instrument)
-            {
-                engine.process_trade_tick(trade);
-            }
-        }
-        drop(cache);
+        self.seed_cached_market_data(instrument_id);
 
         if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
             engine.process_order(&mut order, self.account_id);
@@ -1494,23 +1483,7 @@ impl SandboxInner {
 
             self.ensure_matching_engine(&instrument);
 
-            let cache = self.cache.borrow();
-
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-                if let Some(quote) = cache.quote(&instrument_id)
-                    && check_quote_or_drop("cached quote tick", quote, &instrument)
-                {
-                    engine.process_quote_tick(quote);
-                }
-
-                if self.config.trade_execution
-                    && let Some(trade) = cache.trade(&instrument_id)
-                    && check_trade_or_drop("cached trade tick", trade, &instrument)
-                {
-                    engine.process_trade_tick(trade);
-                }
-            }
-            drop(cache);
+            self.seed_cached_market_data(instrument_id);
 
             if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
                 let mut order_clone = order.clone();
@@ -1541,6 +1514,40 @@ impl SandboxInner {
             false,
             false,
         )));
+    }
+
+    fn seed_cached_market_data(&mut self, instrument_id: InstrumentId) {
+        let Some(engine) = self.matching_engines.get_mut(&instrument_id) else {
+            return;
+        };
+
+        // Cached ticks initialize an empty engine; replay would replenish consumed liquidity
+        if self.config.liquidity_consumption
+            && (engine.get_book().update_count != 0 || engine.get_core().last.is_some())
+        {
+            return;
+        }
+
+        let (quote, trade) = {
+            let cache = self.cache.borrow();
+            (
+                cache.quote(&instrument_id).copied(),
+                cache.trade(&instrument_id).copied(),
+            )
+        };
+
+        if let Some(quote) = quote
+            && check_quote_or_drop("cached quote tick", &quote, &engine.instrument)
+        {
+            engine.process_quote_tick(&quote);
+        }
+
+        if self.config.trade_execution
+            && let Some(trade) = trade
+            && check_trade_or_drop("cached trade tick", &trade, &engine.instrument)
+        {
+            engine.process_trade_tick(&trade);
+        }
     }
 
     fn apply_modify_order(&mut self, cmd: &ModifyOrder) {

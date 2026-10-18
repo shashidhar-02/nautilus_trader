@@ -37,7 +37,9 @@ use nautilus_common::{
     testing::wait_until_async,
 };
 use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_execution::engine::ExecutionEngine;
+use nautilus_execution::{
+    engine::ExecutionEngine, reconciliation::generate_reconciliation_order_snapshot_events,
+};
 use nautilus_live::{
     ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome,
     manager::{ExecutionManager, ExecutionManagerConfig},
@@ -98,6 +100,8 @@ const TEST_CHUNK_FAILURE_PRIVATE_KEY: &str =
     "0x4234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 const TEST_CHUNK_DOWNGRADE_PRIVATE_KEY: &str =
     "0x5234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+const TEST_CHUNK_DOWNGRADE_FAILURE_PRIVATE_KEY: &str =
+    "0x6234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 const CANCEL_ALREADY_DONE_ORDER_ID: &str =
     "0xb816482a1234567890abcdef1234567890abcdef1234567890abcdef12345678";
 const FAK_NO_MATCH_REASON: &str = concat!(
@@ -3233,10 +3237,579 @@ async fn test_generate_mass_status_leaves_cached_closed_order_to_its_fills(#[cas
     let fills = mass_status.fill_reports();
     assert!(mass_status.order_reports().is_empty());
     assert_eq!(fills.len(), 1);
-    assert_eq!(
-        fills[&VenueOrderId::from(venue_order_id)][0].last_qty,
-        Quantity::from("6.0000"),
+    let fill = &fills[&VenueOrderId::from(venue_order_id)][0];
+    assert_eq!(fill.last_qty, Quantity::from("6.0000"));
+    assert_eq!(fill.commission, Money::zero(Currency::pUSD()));
+    assert!(mass_status.reports_complete());
+}
+
+#[rstest]
+#[case::unbounded_unfilled(None, "0.0000", "3.0000", "0.0000")]
+#[case::bounded_unfilled(Some(60), "0.0000", "3.0000", "0.0000")]
+#[case::unbounded_filled(None, "2.0000", "3.0000", "2.0000")]
+#[case::bounded_filled(Some(60), "2.0000", "3.0000", "2.0000")]
+#[case::unbounded_pending_without_prior_fill(None, "0.0000", "0.0000", "4.0000")]
+#[case::bounded_pending_without_prior_fill(Some(60), "0.0000", "0.0000", "4.0000")]
+#[tokio::test]
+async fn test_mass_status_replacement_preserves_logical_order(
+    #[case] lookback: Option<u64>,
+    #[case] leg_filled: &str,
+    #[case] prior_filled: &str,
+    #[case] matched: &str,
+) {
+    let state = TestServerState::default();
+    let mut row = load_json("http_open_orders_page.json")["data"][0].clone();
+    row["id"] = json!("0xreplacement");
+    row["original_size"] = json!((dec!(12) - prior_filled.parse::<Decimal>().unwrap()).to_string());
+    row["size_matched"] = json!(matched);
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [row],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument.clone());
+    let order = cache_replaced_order(&cache, &instrument, leg_filled, prior_filled, false);
+
+    let mass_status = client
+        .generate_mass_status(lookback)
+        .await
+        .unwrap()
+        .unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports.get(&VenueOrderId::from("0xreplacement")).unwrap();
+    let events = generate_reconciliation_order_snapshot_events(
+        &order,
+        report,
+        Some(&instrument),
+        UnixNanos::from(1),
     );
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(report.client_order_id, Some(order.client_order_id()));
+    assert_eq!(report.quantity, Quantity::from("12.0000"));
+    assert_eq!(report.filled_qty, order.filled_qty());
+    assert_eq!(
+        report.order_status,
+        if order.filled_qty().is_zero() {
+            OrderStatus::Accepted
+        } else {
+            OrderStatus::PartiallyFilled
+        }
+    );
+    assert!(
+        events.is_empty(),
+        "Unexpected reconciliation events: {events:?}"
+    );
+    assert_eq!(
+        cache.borrow().order(&order.client_order_id()).unwrap(),
+        &order
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_open_order_replacement_fetches_new_logical_fills() {
+    let state = TestServerState::default();
+    let mut row = load_json("http_open_orders_page.json")["data"][0].clone();
+    row["id"] = json!("0xreplacement");
+    row["original_size"] = json!("9.0000");
+    row["size_matched"] = json!("4.0000");
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [row],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(recovery_trades_response(
+        "0xreplacement",
+        "2.0000",
+        "0.6000",
+    ));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument.clone());
+    let order = cache_replaced_order(&cache, &instrument, "2.0000", "3.0000", false);
+
+    let reports = client
+        .generate_order_status_reports(&GenerateOrderStatusReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            open_only: true,
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].client_order_id, Some(order.client_order_id()));
+    assert_eq!(reports[0].quantity, Quantity::from("12.0000"));
+    assert_eq!(reports[0].filled_qty, Quantity::from("7.0000"));
+}
+
+#[rstest]
+#[case::confirmed_unbounded(None, "CONFIRMED", "7.0000")]
+#[case::confirmed_bounded(Some(60), "CONFIRMED", "7.0000")]
+#[case::pending_unbounded(None, "MINED", "5.0000")]
+#[case::pending_bounded(Some(60), "MINED", "5.0000")]
+#[tokio::test]
+async fn test_mass_status_replacement_caps_only_current_leg_fills(
+    #[case] lookback: Option<u64>,
+    #[case] trade_status: &str,
+    #[case] expected_filled: &str,
+) {
+    let state = TestServerState::default();
+    let mut row = load_json("http_open_orders_page.json")["data"][0].clone();
+    row["id"] = json!("0xreplacement");
+    row["original_size"] = json!("9.0000");
+    row["size_matched"] = json!("4.0000");
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [row],
+        "next_cursor": "LTE=",
+    }));
+    let mut trades = recovery_trades_response("0xreplacement", "2.0000", "0.6000");
+    trades["data"][0]["status"] = json!(trade_status);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    trades["data"][0]["match_time"] = json!(now.to_string());
+    *state.trades_response_override.lock().await = Some(trades);
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument.clone());
+    let order = cache_replaced_order(&cache, &instrument, "2.0000", "3.0000", false);
+
+    let mass_status = client
+        .generate_mass_status(lookback)
+        .await
+        .unwrap()
+        .unwrap();
+    let reports = mass_status.order_reports();
+    let report = reports.get(&VenueOrderId::from("0xreplacement")).unwrap();
+    let events = generate_reconciliation_order_snapshot_events(
+        &order,
+        report,
+        Some(&instrument),
+        UnixNanos::from(1),
+    );
+
+    assert_eq!(report.quantity, Quantity::from("12.0000"));
+    assert_eq!(report.filled_qty, Quantity::from(expected_filled));
+    assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
+    assert!(
+        events
+            .iter()
+            .all(|event| matches!(event, OrderEventAny::Filled(_))),
+        "Unexpected reconciliation events: {events:?}"
+    );
+    assert_eq!(events.len(), usize::from(trade_status == "CONFIRMED"));
+}
+
+#[rstest]
+#[case::partial("2.0000", OrderStatus::Canceled, "5.0000", false)]
+#[case::filled("9.0000", OrderStatus::Filled, "12.0000", false)]
+#[case::filled_after_prior_void("9.0000", OrderStatus::Filled, "11.0000", true)]
+#[tokio::test]
+async fn test_terminal_replacement_recovery_preserves_prior_fills(
+    #[case] leg_filled: &str,
+    #[case] status: OrderStatus,
+    #[case] filled_qty: &str,
+    #[case] void_prior_fill: bool,
+) {
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    *state.trades_response_override.lock().await = Some(recovery_trades_response(
+        "0xreplacement",
+        leg_filled,
+        "0.6000",
+    ));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument.clone());
+    let order = cache_replaced_order(&cache, &instrument, "0.0000", "3.0000", void_prior_fill);
+
+    let report = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            client_order_id: Some(order.client_order_id()),
+            venue_order_id: Some(VenueOrderId::from("0xreplacement")),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(report.quantity, Quantity::from("12.0000"));
+    assert_eq!(report.filled_qty, Quantity::from(filled_qty));
+    assert_eq!(report.order_status, status);
+    assert_eq!(report.avg_px, None);
+}
+
+fn cache_replaced_order(
+    cache: &Rc<RefCell<Cache>>,
+    instrument: &InstrumentAny,
+    leg_filled: &str,
+    prior_filled: &str,
+    void_prior_fill: bool,
+) -> OrderAny {
+    let account_id = AccountId::from("POLYMARKET-001");
+    let mut order = make_limit_order_at_price_and_quantity(
+        "O-REPLACED-RESTART",
+        instrument.id(),
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+        Price::from("0.5000"),
+        Quantity::from("12.0000"),
+    );
+    order
+        .apply(TestOrderEventStubs::submitted(&order, account_id))
+        .unwrap();
+    order
+        .apply(TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            VenueOrderId::from("0xoriginal"),
+        ))
+        .unwrap();
+
+    if Quantity::from(prior_filled).is_positive() {
+        order
+            .apply(TestOrderEventStubs::filled(
+                &order,
+                instrument,
+                Some(TradeId::from("prior-leg")),
+                None,
+                Some(Price::from("0.5000")),
+                Some(Quantity::from(prior_filled)),
+                Some(LiquiditySide::Taker),
+                Some(Money::from("0.047490 pUSD")),
+                None,
+                Some(account_id),
+            ))
+            .unwrap();
+    }
+
+    if void_prior_fill {
+        let fill = order
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                OrderEventAny::Filled(fill) => Some(fill.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        let voided = OrderFillVoidedSpec::builder()
+            .trader_id(fill.trader_id)
+            .strategy_id(fill.strategy_id)
+            .instrument_id(fill.instrument_id)
+            .client_order_id(fill.client_order_id)
+            .venue_order_id(fill.venue_order_id)
+            .account_id(fill.account_id)
+            .trade_id(fill.trade_id)
+            .voided_qty(Quantity::from("1.0000"))
+            .order_side(fill.order_side)
+            .order_type(fill.order_type)
+            .last_px(fill.last_px)
+            .currency(fill.currency)
+            .liquidity_side(fill.liquidity_side)
+            .maybe_position_id(fill.position_id)
+            .build();
+        order.apply(OrderEventAny::FillVoided(voided)).unwrap();
+    }
+
+    order
+        .apply(OrderEventAny::Updated(OrderUpdated::new(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            order.client_order_id(),
+            order.quantity(),
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            false,
+            Some(VenueOrderId::from("0xreplacement")),
+            Some(account_id),
+            Some(Price::from("0.6000")),
+            None,
+            None,
+            false,
+        )))
+        .unwrap();
+
+    if Quantity::from(leg_filled).is_positive() {
+        order
+            .apply(TestOrderEventStubs::filled(
+                &order,
+                instrument,
+                Some(TradeId::from("current-leg")),
+                None,
+                Some(Price::from("0.6000")),
+                Some(Quantity::from(leg_filled)),
+                Some(LiquiditySide::Taker),
+                Some(Money::from("0.019500 pUSD")),
+                None,
+                Some(account_id),
+            ))
+            .unwrap();
+    }
+
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    cache.borrow_mut().build_index();
+    assert_eq!(
+        cache
+            .borrow()
+            .client_order_id(&VenueOrderId::from("0xoriginal")),
+        None
+    );
+    order
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cached_closed_order_restart_does_not_rewrite_fill_quantity_or_commission() {
+    let venue_order_id = "0xcached";
+    let commission = Money::from("0.047490 pUSD");
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    let mut trade = recovery_trades_response(venue_order_id, "6.0000", "0.5000")["data"][0].clone();
+    trade["match_time"] = json!((now_secs - 60).to_string());
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [trade],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let account_id = AccountId::from("POLYMARKET-001");
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument.clone());
+    let mut order = make_limit_order(
+        "O-CACHED-RESTART",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Ioc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id);
+    let applied = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::from("trade-recovery")),
+        None,
+        Some(Price::from("0.5000")),
+        Some(Quantity::from("6.0000")),
+        Some(LiquiditySide::Taker),
+        Some(commission),
+        None,
+        Some(account_id),
+    );
+    order = cache.borrow_mut().update_order(&applied).unwrap();
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("mass status")
+        .expect("mass status available");
+    assert!(mass_status.reports_complete());
+    assert!(mass_status.order_reports().is_empty());
+    let fill = &mass_status.fill_reports()[&VenueOrderId::from(venue_order_id)][0];
+    assert_eq!(fill.last_qty, Quantity::from("6.0000"));
+    assert_eq!(fill.commission, Money::zero(Currency::pUSD()));
+
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut manager = ExecutionManager::new(
+        clock.clone(),
+        cache.clone(),
+        ExecutionManagerConfig::default(),
+    )
+    .unwrap();
+    let mut engine = ExecutionEngine::new(clock, cache.clone(), None);
+    engine.register_client(Box::new(client)).unwrap();
+    let engine = Rc::new(RefCell::new(engine));
+    manager.reconcile_execution_mass_status(&mass_status, &engine);
+
+    let cached = cache
+        .borrow()
+        .order(&order.client_order_id())
+        .unwrap()
+        .clone();
+    assert_eq!(cached.filled_qty(), Quantity::from("6.0000"));
+    assert_eq!(cached.trade_ids(), vec![&TradeId::from("trade-recovery")]);
+    assert_eq!(
+        cached.commissions().values().copied().collect::<Vec<_>>(),
+        vec![commission],
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_foreign_cached_order_does_not_complete_bounded_fill() {
+    let venue_order_id = "0xcached";
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    let mut trade = recovery_trades_response(venue_order_id, "6.0000", "0.5000")["data"][0].clone();
+    trade["match_time"] = json!((now_secs - 60).to_string());
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [trade],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    let foreign_account = AccountId::from("POLYMARKET-002");
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+    let mut order = make_limit_order(
+        "O-FOREIGN",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Ioc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    let submitted = TestOrderEventStubs::submitted(&order, foreign_account);
+    order = cache.borrow_mut().update_order(&submitted).unwrap();
+    let accepted =
+        TestOrderEventStubs::accepted(&order, foreign_account, VenueOrderId::from(venue_order_id));
+    cache.borrow_mut().update_order(&accepted).unwrap();
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("mass status")
+        .expect("mass status available");
+
+    let fill = &mass_status.fill_reports()[&VenueOrderId::from(venue_order_id)][0];
+    assert!(mass_status.order_reports().is_empty());
+    assert_eq!(fill.last_qty, Quantity::from("6.0000"));
+    assert_eq!(fill.commission, Money::zero(Currency::pUSD()));
+    assert!(!mass_status.reports_complete());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cached_order_does_not_conceal_unmapped_in_scope_history() {
+    let venue_order_id = "0xcached";
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    let mut mapped =
+        recovery_trades_response(venue_order_id, "6.0000", "0.5000")["data"][0].clone();
+    mapped["match_time"] = json!((now_secs - 60).to_string());
+    let mut unmapped = mapped.clone();
+    unmapped["id"] = json!("trade-unmapped");
+    unmapped["asset_id"] = json!("999");
+    unmapped["taker_order_id"] = json!("0xunmapped");
+    let unmapped_instrument_id = InstrumentId::from(
+        "0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917-999.POLYMARKET",
+    );
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [mapped, unmapped],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let mut config = create_test_exec_config(addr);
+    config.instrument_config = Some(PolymarketInstrumentProviderConfig {
+        load_ids: Some(vec![instrument_id, unmapped_instrument_id]),
+        ..Default::default()
+    });
+    let (mut client, _rx, cache) = create_test_execution_client_from_config(config);
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+    let mut order = make_limit_order(
+        "O-CACHED-UNMAPPED",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Ioc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id);
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("mass status")
+        .expect("mass status available");
+
+    let fill = &mass_status.fill_reports()[&VenueOrderId::from(venue_order_id)][0];
+    assert_eq!(mass_status.fill_reports().len(), 1);
+    assert!(mass_status.order_reports().is_empty());
+    assert_eq!(fill.last_qty, Quantity::from("6.0000"));
+    assert_eq!(fill.commission, Money::zero(Currency::pUSD()));
     assert!(!mass_status.reports_complete());
 }
 
@@ -7465,14 +8038,29 @@ async fn test_generate_order_status_report_recovers_canceled_when_no_trades() {
 }
 
 #[rstest]
+#[case::hash(Some(json!("0xabc123")))]
+#[case::missing(None)]
+#[case::null(Some(Value::Null))]
+#[case::empty(Some(json!("")))]
 #[tokio::test]
-async fn test_generate_order_status_report_keeps_terminal_recovery_for_valid_failed_trade() {
+async fn test_generate_order_status_report_keeps_terminal_recovery_for_valid_failed_trade(
+    #[case] hash: Option<Value>,
+) {
     let venue_order_id =
         VenueOrderId::from("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12");
     let state = TestServerState::default();
     *state.single_order_response.lock().await = Some(Value::Null);
     let mut trades = recovery_trades_response(venue_order_id.as_str(), "10.0000", "0.5000");
     trades["data"][0]["status"] = json!("FAILED");
+    trades["data"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("transaction_hash");
+
+    if let Some(hash) = hash {
+        trades["data"][0]["transaction_hash"] = hash;
+    }
+
     *state.trades_response_override.lock().await = Some(trades);
     let addr = start_mock_server(state).await;
     let (mut client, _rx, cache) = create_test_execution_client(addr);
@@ -10166,6 +10754,257 @@ async fn test_modify_order_guard_rejects_without_venue_requests(
 }
 
 #[rstest]
+#[case::below_minimum(
+    Some(json!("5")),
+    ("0.01", TimeInForce::Gtc, "10.0000", "0.5000", Some("7.0000"), "0.6000"),
+    "Polymarket replacement amount 3 shares is below the market minimum order size 5"
+)]
+#[case::non_string_minimum(
+    Some(json!(5)),
+    ("0.01", TimeInForce::Gtc, "10.0000", "0.5000", None, "0.6000"),
+    "Polymarket market minimum order size 5 is not a positive decimal quantity"
+)]
+#[case::immediate_buy_below_signed_shares(
+    Some(json!("5")),
+    ("0.001", TimeInForce::Fok, "5.0000", "0.226", None, "0.227"),
+    "Polymarket replacement amount 4.97798 shares is below the market minimum order size 5"
+)]
+#[case::immediate_buy_zero_budget(
+    Some(json!("5")),
+    ("0.01", TimeInForce::Ioc, "0.0100", "0.0100", None, "0.0200"),
+    "Polymarket FAK BUY maker amount 0.0002 pUSD truncates to zero at 2 decimal places"
+)]
+#[tokio::test]
+async fn test_modify_order_market_minimum_rejects_without_cancel(
+    #[case] min_order_size: Option<Value>,
+    #[case] order: (&str, TimeInForce, &str, &str, Option<&str>, &str),
+    #[case] expected_reason: &str,
+) {
+    let (tick_size, time_in_force, quantity, price, filled, new_price) = order;
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_tick(&cache, instrument_id, tick_size, 4);
+    set_min_order_size(&cache, instrument_id, min_order_size);
+    let venue_order_id = "0xmodify-min-size";
+    let mut order = make_limit_order_at_price_and_quantity(
+        "O-MODIFY-MIN-SIZE",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        time_in_force,
+        Price::from(price),
+        Quantity::from(quantity),
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id);
+
+    if let Some(filled) = filled {
+        let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            Some(TradeId::from("T-MODIFY-MIN-SIZE")),
+            None,
+            Some(Price::from(price)),
+            Some(Quantity::from(filled)),
+            Some(LiquiditySide::Maker),
+            None,
+            None,
+            Some(AccountId::from("POLYMARKET-001")),
+        );
+        order = cache.borrow_mut().update_order(&fill).unwrap();
+    }
+
+    client
+        .modify_order(make_modify_cmd(
+            "O-MODIFY-MIN-SIZE",
+            instrument_id,
+            None,
+            Some(Price::from(new_price)),
+        ))
+        .unwrap();
+
+    let rejected = assert_order_event(recv_execution_event(&mut rx).await, "ModifyRejected");
+    assert_eq!(order_event_reason(&rejected), expected_reason);
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .status(),
+        order.status()
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .venue_order_id(),
+        Some(VenueOrderId::from(venue_order_id))
+    );
+    assert_eq!(*state.cancel_delete_count.lock().await, 0);
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_modify_order_fill_during_cancel_below_market_minimum_is_not_submitted() {
+    let state = TestServerState::default();
+    let old_venue_order_id = "0xmodify-min-after-cancel";
+    *state.cancel_response.lock().await = Some(json!({
+        "canceled": [old_venue_order_id],
+        "not_canceled": {}
+    }));
+    *state.single_order_response.lock().await = Some(canceled_order_response(
+        old_venue_order_id,
+        "10.0000",
+        "7.0000",
+        "0.5000",
+    ));
+    *state.trades_response_override.lock().await = Some(confirmed_taker_trade_response(
+        old_venue_order_id,
+        "modify-min-late-fill",
+        "7.0000",
+        "0.5000",
+    ));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    set_min_order_size(&cache, instrument_id, Some(json!("5")));
+    let mut order = make_limit_order_at_price_and_quantity(
+        "O-MODIFY-MIN-AFTER-CANCEL",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+        Price::from("0.5000"),
+        Quantity::from("10.0000"),
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, old_venue_order_id);
+    state
+        .open_order_ids
+        .lock()
+        .await
+        .insert(old_venue_order_id.to_string());
+
+    client
+        .modify_order(make_modify_cmd(
+            "O-MODIFY-MIN-AFTER-CANCEL",
+            instrument_id,
+            None,
+            Some(Price::from("0.6000")),
+        ))
+        .unwrap();
+
+    match recv_execution_event(&mut rx).await {
+        ExecutionEvent::Report(ExecutionReport::Fill(fill)) => {
+            assert_eq!(fill.venue_order_id, VenueOrderId::from(old_venue_order_id));
+            assert_eq!(fill.last_qty, Quantity::from("7.0000"));
+        }
+        other => panic!("Expected reconciled fill report, was {other:?}"),
+    }
+    let rejected = assert_order_event(recv_execution_event(&mut rx).await, "ModifyRejected");
+    assert_eq!(
+        order_event_reason(&rejected),
+        "Polymarket replacement amount 3 shares is below the market minimum order size 5"
+    );
+    assert_order_event(recv_execution_event(&mut rx).await, "Canceled");
+    assert_eq!(*state.cancel_delete_count.lock().await, 1);
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_modify_order_at_market_minimum_submits_replacement() {
+    let state = TestServerState::default();
+    let old_venue_order_id = "0xmodify-at-minimum";
+    *state.cancel_response.lock().await = Some(json!({
+        "canceled": [old_venue_order_id],
+        "not_canceled": {}
+    }));
+    *state.single_order_response.lock().await = Some(canceled_order_response(
+        old_venue_order_id,
+        "5.0000",
+        "0.0000",
+        "0.5000",
+    ));
+    *state.trades_response_override.lock().await = Some(json!({"data": [], "next_cursor": "LTE="}));
+    state
+        .order_response_uses_request_hash
+        .store(true, Ordering::Release);
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    set_min_order_size(&cache, instrument_id, Some(json!("5")));
+    let mut order = make_limit_order_at_price_and_quantity(
+        "O-MODIFY-AT-MINIMUM",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+        Price::from("0.5000"),
+        Quantity::from("5.0000"),
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, old_venue_order_id);
+    state
+        .open_order_ids
+        .lock()
+        .await
+        .insert(old_venue_order_id.to_string());
+
+    client
+        .modify_order(make_modify_cmd(
+            "O-MODIFY-AT-MINIMUM",
+            instrument_id,
+            None,
+            Some(Price::from("0.6000")),
+        ))
+        .unwrap();
+
+    let updated = assert_order_event(recv_execution_event(&mut rx).await, "Updated");
+    let OrderEventAny::Updated(updated) = updated else {
+        unreachable!("assert_order_event checked the variant")
+    };
+    assert_eq!(updated.quantity, Quantity::from("5.0000"));
+    assert_eq!(updated.price, Some(Price::from("0.6000")));
+    assert_ne!(
+        updated.venue_order_id,
+        Some(VenueOrderId::from(old_venue_order_id))
+    );
+    assert_eq!(*state.order_post_count.lock().await, 1);
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_modify_order_task_admission_failure_clears_pending_state() {
     let state = TestServerState::default();
@@ -11644,10 +12483,12 @@ async fn test_limit_fok_deferred_check_rejects_contradictory_signed_quantity() {
     assert_no_execution_event(&mut rx).await;
 }
 
-// A MATCHED FOK report excludes provisional quantity until the trade confirms
 #[rstest]
+#[case::market(OrderType::Market)]
+#[case::base_limit(OrderType::Limit)]
 #[tokio::test]
-async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
+async fn test_fok_deferred_check_filled_report_requires_base_limit(#[case] order_type: OrderType) {
+    let price = Price::from("0.5100");
     let state = TestServerState::default();
     *state.single_order_response.lock().await = Some(json!({
         "associate_trades": [],
@@ -11658,7 +12499,7 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
         "outcome": "Yes",
         "maker_address": "0xtest",
         "owner": "test-owner",
-        "price": "0.5100",
+        "price": price.to_string(),
         "side": "BUY",
         "size_matched": "10.0000",
         "asset_id": "TEST-TOKEN",
@@ -11673,13 +12514,27 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
     let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
     add_instrument_to_cache(&cache, instrument_id);
 
-    let order = make_market_order_with_time_in_force(
-        "O-FOK-MATCHED",
-        instrument_id,
-        OrderSide::Buy,
-        true,
-        TimeInForce::Fok,
-    );
+    let order = if order_type == OrderType::Limit {
+        make_limit_order_at_price(
+            "O-FOK-MATCHED",
+            instrument_id,
+            OrderSide::Buy,
+            false,
+            false,
+            false,
+            TimeInForce::Fok,
+            price,
+        )
+    } else {
+        make_market_order_with_time_in_force(
+            "O-FOK-MATCHED",
+            instrument_id,
+            OrderSide::Buy,
+            true,
+            TimeInForce::Fok,
+        )
+    };
+
     cache
         .borrow_mut()
         .add_order(order.clone(), None, None, false)
@@ -11688,12 +12543,9 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
 
     client.submit_order(cmd).unwrap();
 
-    for expected in ["Submitted", "Updated"] {
-        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_order_event(event, expected);
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    if order_type == OrderType::Market {
+        assert_order_event(recv_execution_event(&mut rx).await, "Updated");
     }
 
     let accepted = tokio::time::timeout(Duration::from_secs(10), rx.recv())
@@ -11702,19 +12554,25 @@ async fn test_fok_deferred_check_filled_emits_report_for_reconciliation() {
         .unwrap();
     assert_order_event(accepted, "Accepted");
 
-    // Venue Filled with no confirmed local fills surfaces no fill quantity
-    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    if order_type == OrderType::Limit {
+        // A MATCHED FOK report excludes provisional quantity until the trade confirms
+        let event = recv_execution_event(&mut rx).await;
 
-    match event {
-        ExecutionEvent::Report(ExecutionReport::Order(report)) => {
-            assert_eq!(report.order_status, OrderStatus::Filled);
-            assert_eq!(report.filled_qty, Quantity::zero(0));
+        match event {
+            ExecutionEvent::Report(ExecutionReport::Order(report)) => {
+                assert_eq!(report.client_order_id, Some(order.client_order_id()));
+                assert_eq!(report.order_type, OrderType::Limit);
+                assert_eq!(report.order_status, OrderStatus::Filled);
+                assert_eq!(report.quantity, Quantity::from("10"));
+                assert_eq!(report.filled_qty, Quantity::zero(0));
+                assert_eq!(report.price, Some(price));
+            }
+            other => panic!("Expected Order report, was {other:?}"),
         }
-        other => panic!("Expected Order report, was {other:?}"),
     }
+
+    assert_eq!(state.single_order_get_count.load(Ordering::Acquire), 1);
+    assert_no_execution_event(&mut rx).await;
 }
 
 #[rstest]
@@ -12103,6 +12961,29 @@ fn replace_fee_schedule(
             "rebateRate": "0",
         }),
     );
+    binary.info = Some(info);
+    cache.borrow_mut().add_instrument(instrument).unwrap();
+}
+
+fn set_min_order_size(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    min_order_size: Option<Value>,
+) {
+    let mut instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    let InstrumentAny::BinaryOption(binary) = &mut instrument else {
+        panic!("expected binary option test instrument");
+    };
+    let mut info = binary.info.take().unwrap_or_default();
+
+    match min_order_size {
+        Some(value) => {
+            info.insert("min_order_size".into(), value);
+        }
+        None => {
+            info.shift_remove("min_order_size");
+        }
+    }
     binary.info = Some(info);
     cache.borrow_mut().add_instrument(instrument).unwrap();
 }
@@ -17294,6 +18175,260 @@ async fn test_cancel_all_missing_instrument_returns_error_without_request() {
 }
 
 #[rstest]
+#[tokio::test]
+async fn test_group_cancel_preserves_unknown_suffix_after_tier_downgrade() {
+    let state = TestServerState::default();
+    state
+        .batch_cancel_echo_rejections
+        .store(true, Ordering::Release);
+    state.batch_cancel_response_statuses.lock().await.extend([
+        StatusCode::OK,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_REQUEST,
+    ]);
+
+    for tier in ["Gold", "Standard"] {
+        let mut headers = HeaderMap::new();
+        headers.insert("poly-ratelimit-tier", tier.parse().unwrap());
+        state
+            .batch_cancel_response_headers
+            .lock()
+            .await
+            .push_back(headers);
+    }
+
+    let addr = start_mock_server(state.clone()).await;
+    let mut config = create_test_exec_config_with_retries(addr, 1);
+    config.private_key = Some(TEST_CHUNK_DOWNGRADE_FAILURE_PRIVATE_KEY.into());
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    client.start().unwrap();
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let mut cancels = Vec::new();
+
+    for index in 0..241 {
+        let client_order_id = format!("O-DOWNGRADE-FAILURE-{index}");
+        let venue_order_id = format!("0x{index:064x}");
+        let mut order = make_limit_order(
+            &client_order_id,
+            instrument_id,
+            OrderSide::Buy,
+            false,
+            false,
+            false,
+            TimeInForce::Gtc,
+        );
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        submit_and_accept_order(&cache, &mut order, &venue_order_id);
+        cancels.push(make_cancel_cmd(&client_order_id, instrument_id));
+    }
+
+    client
+        .batch_cancel_orders(BatchCancelOrders::new(
+            TraderId::from("TESTER-001"),
+            Some(*POLYMARKET_CLIENT_ID),
+            StrategyId::from("S-001"),
+            instrument_id,
+            cancels,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .unwrap();
+    let mut rejected = HashSet::new();
+
+    for _ in 0..240 {
+        let event = assert_order_event(recv_execution_event(&mut rx).await, "CancelRejected");
+        assert!(rejected.insert(event.client_order_id().to_string()));
+    }
+
+    assert_no_execution_event(&mut rx).await;
+    let bodies = state.batch_cancel_bodies.lock().await;
+    assert_eq!(
+        bodies
+            .iter()
+            .map(|body| body.as_array().unwrap().len())
+            .collect::<Vec<_>>(),
+        [120, 121, 120]
+    );
+    assert_eq!(
+        rejected,
+        (0..240)
+            .map(|index| format!("O-DOWNGRADE-FAILURE-{index}"))
+            .collect()
+    );
+    assert_eq!(
+        bodies[1].as_array().unwrap()[..120],
+        bodies[2].as_array().unwrap()[..]
+    );
+    assert_eq!(*state.batch_cancel_delete_count.lock().await, 3);
+}
+
+#[rstest]
+#[case::batch_rejected(false, StatusCode::BAD_REQUEST, None)]
+#[case::all_by_id_rejected(true, StatusCode::BAD_REQUEST, None)]
+#[case::batch_ambiguous(false, StatusCode::INTERNAL_SERVER_ERROR, None)]
+#[case::all_by_id_ambiguous(true, StatusCode::INTERNAL_SERVER_ERROR, None)]
+#[case::batch_signer_limited(false, StatusCode::TOO_MANY_REQUESTS, None)]
+#[case::all_by_id_signer_limited(true, StatusCode::TOO_MANY_REQUESTS, None)]
+#[case::duplicate_completed_id(false, StatusCode::BAD_REQUEST, Some((0, 120)))]
+#[case::duplicate_failed_suffix_ambiguous(false, StatusCode::INTERNAL_SERVER_ERROR, Some((120, 240)))]
+#[case::duplicate_failed_suffix_rejected(false, StatusCode::BAD_REQUEST, Some((120, 240)))]
+#[tokio::test]
+async fn test_group_cancel_preserves_completed_chunks_on_later_failure(
+    #[case] cancel_all: bool,
+    #[case] failure_status: StatusCode,
+    #[case] duplicate: Option<(usize, usize)>,
+) {
+    let state = TestServerState::default();
+    state
+        .batch_cancel_echo_cancellations
+        .store(true, Ordering::Release);
+    state
+        .batch_cancel_response_statuses
+        .lock()
+        .await
+        .extend([StatusCode::OK, failure_status]);
+    let mut headers = HeaderMap::new();
+    headers.insert("poly-ratelimit-tier", "Standard".parse().unwrap());
+    state
+        .batch_cancel_response_headers
+        .lock()
+        .await
+        .extend([HeaderMap::new(), headers]);
+    let addr = start_mock_server(state.clone()).await;
+    let mut config = create_test_exec_config_with_retries(addr, 0);
+    config.private_key = Some(TEST_CHUNK_FAILURE_PRIVATE_KEY.into());
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    client.start().unwrap();
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let mut cancels = Vec::new();
+    let mut client_ids = std::collections::HashMap::new();
+
+    for index in 0..241 {
+        let client_order_id = format!("O-PRESERVE-{index}");
+        let venue_order_id = format!("0x{index:064x}");
+        let mut order = make_limit_order(
+            &client_order_id,
+            instrument_id,
+            OrderSide::Buy,
+            false,
+            false,
+            false,
+            TimeInForce::Gtc,
+        );
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        submit_and_accept_order(&cache, &mut order, &venue_order_id);
+        cancels.push(make_cancel_cmd(&client_order_id, instrument_id));
+        client_ids.insert(
+            venue_order_id,
+            ClientOrderId::from(client_order_id.as_str()),
+        );
+    }
+
+    if let Some((source, position)) = duplicate {
+        let client_order_id = format!("O-PRESERVE-{source}");
+        cancels.insert(position, make_cancel_cmd(&client_order_id, instrument_id));
+    }
+
+    if cancel_all {
+        client
+            .cancel_all_orders(make_cancel_all_cmd(
+                StrategyId::from("S-001"),
+                instrument_id,
+                Some(OrderSide::Buy),
+            ))
+            .unwrap();
+    } else {
+        client
+            .batch_cancel_orders(BatchCancelOrders::new(
+                TraderId::from("TESTER-001"),
+                Some(*POLYMARKET_CLIENT_ID),
+                StrategyId::from("S-001"),
+                instrument_id,
+                cancels,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+    }
+
+    let ambiguous = failure_status == StatusCode::INTERNAL_SERVER_ERROR;
+    let expected_count = if ambiguous { 121 } else { 241 };
+    let mut canceled = HashSet::new();
+    let mut rejected = HashSet::new();
+    let mut unsent = HashSet::new();
+
+    for _ in 0..expected_count {
+        let ExecutionEvent::Order(event) = recv_execution_event(&mut rx).await else {
+            panic!("expected order event");
+        };
+
+        match event {
+            OrderEventAny::Canceled(event) => {
+                assert!(canceled.insert(event.client_order_id));
+            }
+            OrderEventAny::CancelRejected(event) => {
+                if event.reason == "Cancel not sent because an earlier chunk failed" {
+                    assert!(unsent.insert(event.client_order_id));
+                } else {
+                    assert!(rejected.insert(event.client_order_id));
+                }
+            }
+            event => panic!("unexpected order event: {event:?}"),
+        }
+    }
+
+    assert_no_execution_event(&mut rx).await;
+    let bodies = state.batch_cancel_bodies.lock().await;
+    let completed_ids = bodies[0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| client_ids[id.as_str().unwrap()])
+        .collect::<HashSet<_>>();
+    let failed_ids = bodies[1]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| client_ids[id.as_str().unwrap()])
+        .filter(|id| !completed_ids.contains(id))
+        .collect::<HashSet<_>>();
+    let unsent_ids = client_ids
+        .values()
+        .copied()
+        .filter(|id| !completed_ids.contains(id) && !failed_ids.contains(id))
+        .collect::<HashSet<_>>();
+
+    assert_eq!(
+        bodies
+            .iter()
+            .map(|body| body.as_array().unwrap().len())
+            .collect::<Vec<_>>(),
+        [120, 120]
+    );
+    assert_eq!(canceled, completed_ids);
+    assert_eq!(
+        rejected,
+        if ambiguous {
+            HashSet::new()
+        } else {
+            failed_ids
+        }
+    );
+    assert_eq!(unsent, unsent_ids);
+    assert_eq!(*state.batch_cancel_delete_count.lock().await, 2);
+}
+
+#[rstest]
 #[case::batch(1_121, TEST_CHUNK_PRIVATE_KEY, CancelChunkRetry::Succeeds)]
 #[case::late_failure(121, TEST_CHUNK_FAILURE_PRIVATE_KEY, CancelChunkRetry::Exhausts)]
 #[case::tier_downgrade(241, TEST_CHUNK_DOWNGRADE_PRIVATE_KEY, CancelChunkRetry::Downgrades)]
@@ -17396,23 +18531,20 @@ async fn test_group_cancel_orders_bounds_retries_and_result_processing(
 
     let mut processed_client_order_ids = HashSet::with_capacity(order_count);
 
-    if matches!(chunk_retry, CancelChunkRetry::Exhausts) {
-        wait_until_async(
-            || {
-                let state = state.clone();
-                async move { *state.batch_cancel_delete_count.lock().await == 3 }
-            },
-            Duration::from_secs(5),
-        )
-        .await;
+    let expected_processed_count = if matches!(chunk_retry, CancelChunkRetry::Exhausts) {
+        120
     } else {
-        for _ in 0..order_count {
-            let event = assert_order_event(recv_execution_event(&mut rx).await, "CancelRejected");
-            let OrderEventAny::CancelRejected(event) = event else {
-                unreachable!();
-            };
-            assert!(processed_client_order_ids.insert(event.client_order_id.to_string()));
-        }
+        order_count
+    };
+
+    for _ in 0..expected_processed_count {
+        let event = assert_order_event(recv_execution_event(&mut rx).await, "CancelRejected");
+
+        let OrderEventAny::CancelRejected(event) = event else {
+            unreachable!();
+        };
+
+        assert!(processed_client_order_ids.insert(event.client_order_id.to_string()));
     }
     assert_no_execution_event(&mut rx).await;
 
@@ -17456,11 +18588,13 @@ async fn test_group_cancel_orders_bounds_retries_and_result_processing(
 
     assert_eq!(successful_order_ids, expected_successful_order_ids);
 
-    if matches!(chunk_retry, CancelChunkRetry::Exhausts) {
-        assert!(processed_client_order_ids.is_empty());
+    let expected_processed_ids = if matches!(chunk_retry, CancelChunkRetry::Exhausts) {
+        (0..120).map(|index| format!("O-CHUNK-{index}")).collect()
     } else {
-        assert_eq!(processed_client_order_ids, expected_client_order_ids);
-    }
+        expected_client_order_ids
+    };
+
+    assert_eq!(processed_client_order_ids, expected_processed_ids);
     assert_eq!(*state.batch_cancel_delete_count.lock().await, bodies.len());
 }
 
@@ -17694,6 +18828,272 @@ async fn test_disconnect_waits_for_shutdown_cancel_response() {
         .expect("disconnect cancel response should be processed")
         .expect("execution event channel should remain open");
     assert_order_event(event, "CancelRejected");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_disconnect_applies_cancel_response_inside_shutdown_budget() {
+    let state = TestServerState::default();
+    let venue_order_id = "0xvenue-disconnect-budget-applied";
+    *state.cancel_response.lock().await = Some(json!({
+        "canceled": [],
+        "not_canceled": {(venue_order_id): "order not found"}
+    }));
+    state.cancel_request_gate.enable();
+
+    let addr = start_mock_server(state.clone()).await;
+    let mut config = create_test_exec_config(addr);
+    config.http_timeout_secs = 60;
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let mut order = make_limit_order(
+        "O-DISCONNECT-BUDGET-APPLIED",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id);
+    mark_pending_cancel(&cache, &mut order);
+    client
+        .cancel_order(make_cancel_cmd(
+            "O-DISCONNECT-BUDGET-APPLIED",
+            instrument_id,
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let gate = state.cancel_request_gate.clone();
+            async move { gate.started() == 1 }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let mut disconnect = Box::pin(client.disconnect());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), disconnect.as_mut())
+            .await
+            .is_err(),
+        "disconnect should still be waiting when the cancel response is released"
+    );
+    let started = tokio::time::Instant::now();
+    state.cancel_request_gate.release();
+    disconnect.await.unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a cancel response inside the shutdown budget should be applied, elapsed {:?}",
+        started.elapsed()
+    );
+    assert!(!client.is_connected());
+    let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("in-budget cancel response should be processed")
+        .expect("execution event channel should remain open");
+    assert_order_event(event, "CancelRejected");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_disconnect_bounds_unconfirmed_cancel() {
+    let state = TestServerState::default();
+    let venue_order_id = "0xvenue-disconnect-budget-held";
+    *state.cancel_response.lock().await = Some(json!({
+        "canceled": [venue_order_id],
+        "not_canceled": {}
+    }));
+    state.cancel_request_gate.enable();
+
+    let addr = start_mock_server(state.clone()).await;
+    let mut config = create_test_exec_config(addr);
+    config.http_timeout_secs = 60;
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let mut order = make_limit_order(
+        "O-DISCONNECT-BUDGET-HELD",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id);
+    mark_pending_cancel(&cache, &mut order);
+    client
+        .cancel_order(make_cancel_cmd("O-DISCONNECT-BUDGET-HELD", instrument_id))
+        .unwrap();
+    wait_until_async(
+        || {
+            let gate = state.cancel_request_gate.clone();
+            async move { gate.started() == 1 }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(12), client.disconnect())
+        .await
+        .expect("disconnect should finish inside the node disconnect timeout")
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(9),
+        "disconnect took {elapsed:?}, past the bounded shutdown budget"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5),
+        "disconnect returned in {elapsed:?}, before the shutdown budget"
+    );
+    assert!(!client.is_connected());
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&order.client_order_id())
+            .expect("order should remain cached")
+            .status(),
+        OrderStatus::PendingCancel
+    );
+    state.cancel_request_gate.release();
+    tokio::task::yield_now().await;
+    assert_no_terminal_cancel(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_dropped_disconnect_marks_client_disconnected_without_cancel() {
+    let state = TestServerState::default();
+    let venue_order_id = "0xvenue-disconnect-dropped";
+    *state.cancel_response.lock().await = Some(json!({
+        "canceled": [venue_order_id],
+        "not_canceled": {}
+    }));
+    state.cancel_request_gate.enable();
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let mut order = make_limit_order(
+        "O-DISCONNECT-DROPPED",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id);
+    mark_pending_cancel(&cache, &mut order);
+    client
+        .cancel_order(make_cancel_cmd("O-DISCONNECT-DROPPED", instrument_id))
+        .unwrap();
+    wait_until_async(
+        || {
+            let gate = state.cancel_request_gate.clone();
+            async move { gate.started() == 1 }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let mut disconnect = Box::pin(client.disconnect());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_200), disconnect.as_mut())
+            .await
+            .is_err(),
+        "disconnect should still be waiting when the future is dropped"
+    );
+    drop(disconnect);
+
+    assert!(!client.is_connected());
+    state.cancel_request_gate.release();
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_no_terminal_cancel(&mut rx).await;
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&order.client_order_id())
+            .expect("order should remain cached")
+            .status(),
+        OrderStatus::PendingCancel
+    );
+}
+
+fn mark_pending_cancel(cache: &Rc<RefCell<Cache>>, order: &mut OrderAny) {
+    let pending_cancel = OrderPendingCancel::new(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        Some(AccountId::from("POLYMARKET-001")),
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        false,
+        order.venue_order_id(),
+    );
+    *order = cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::PendingCancel(pending_cancel))
+        .unwrap();
+}
+
+async fn assert_no_terminal_cancel(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Err(_) => return,
+            Ok(None) => panic!("execution event channel closed"),
+            Ok(Some(ExecutionEvent::Order(OrderEventAny::Canceled(event)))) => {
+                panic!("unconfirmed cancel was reported as canceled: {event:?}")
+            }
+            Ok(Some(ExecutionEvent::Order(OrderEventAny::CancelRejected(event)))) => {
+                panic!("unconfirmed cancel was reported as rejected: {event:?}")
+            }
+            Ok(Some(_)) => {}
+        }
+    }
 }
 
 fn submit_and_pending_cancel(cache: &Rc<RefCell<Cache>>, order: &mut OrderAny) {
@@ -19403,14 +20803,19 @@ async fn test_account_refresh_uses_own_order_reservations(#[case] fill_remaining
     let ExecutionEvent::Account(event) = event else {
         panic!("Expected account state");
     };
-    assert_eq!(
-        event.balances,
-        vec![AccountBalance::new(
-            Money::from("98.4 pUSD"),
-            Money::from("0 pUSD"),
-            Money::from("98.4 pUSD"),
-        )]
+
+    let expected_locked = if fill_remaining {
+        Money::from("2.4 pUSD")
+    } else {
+        Money::from("0 pUSD")
+    };
+
+    let expected_balance = AccountBalance::new(
+        Money::from("98.4 pUSD"),
+        expected_locked,
+        Money::from("98.4 pUSD") - expected_locked,
     );
+    assert_eq!(event.balances, vec![expected_balance]);
     let handle = registry
         .handle(*POLYMARKET_CLIENT_ID, Ustr::from("polymarket-user-streams"))
         .unwrap();
@@ -19425,14 +20830,8 @@ async fn test_account_refresh_uses_own_order_reservations(#[case] fill_remaining
     let ExecutionEvent::Account(event) = event else {
         panic!("Expected reconnect account state");
     };
-    assert_eq!(
-        event.balances,
-        vec![AccountBalance::new(
-            Money::from("98.4 pUSD"),
-            Money::from("0 pUSD"),
-            Money::from("98.4 pUSD"),
-        )]
-    );
+
+    assert_eq!(event.balances, vec![expected_balance]);
     assert_eq!(state.orders_get_count.load(Ordering::Acquire), 0);
     client.disconnect().await.unwrap();
 }

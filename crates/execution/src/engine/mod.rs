@@ -135,7 +135,6 @@ pub struct ExecutionEngine {
     external_clients: HashSet<ClientId>,
     pos_id_generator: PositionIdGenerator,
     config: ExecutionEngineConfig,
-    orders_dispatched: RefCell<AHashSet<ClientOrderId>>,
     command_count: Cell<u64>,
     event_count: u64,
     report_count: u64,
@@ -232,7 +231,6 @@ impl ExecutionEngine {
             external_clients,
             pos_id_generator: PositionIdGenerator::new(trader_id, clock),
             config: config.unwrap_or_default(),
-            orders_dispatched: RefCell::new(AHashSet::new()),
             command_count: Cell::new(0),
             event_count: 0,
             report_count: 0,
@@ -754,13 +752,18 @@ impl ExecutionEngine {
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
-            .map(ExecutionClientAdapter::connect)
+            .map(|client| async move {
+                let client_id = client.client_id;
+                (client_id, client.connect().await)
+            })
             .collect();
 
         let results = join_all(futures).await;
 
-        for error in results.into_iter().filter_map(Result::err) {
-            log::error!("Failed to connect execution client: {error:#}");
+        for (client_id, result) in results {
+            if result.is_err() {
+                log::error!("Failed to connect execution client {client_id}: connection failed");
+            }
         }
     }
 
@@ -773,19 +776,24 @@ impl ExecutionEngine {
         let futures: Vec<_> = self
             .get_clients_mut()
             .into_iter()
-            .map(ExecutionClientAdapter::disconnect)
+            .map(|client| async move {
+                let client_id = client.client_id;
+                (client_id, client.disconnect().await)
+            })
             .collect();
 
         let results = join_all(futures).await;
-        let errors: Vec<_> = results.into_iter().filter_map(Result::err).collect();
+        let failed_clients: Vec<_> = results
+            .into_iter()
+            .filter_map(|(client_id, result)| result.err().map(|_| client_id.to_string()))
+            .collect();
 
-        if errors.is_empty() {
+        if failed_clients.is_empty() {
             Ok(())
         } else {
-            let error_msgs: Vec<_> = errors.iter().map(ToString::to_string).collect();
             anyhow::bail!(
                 "Failed to disconnect execution clients: {}",
-                error_msgs.join("; ")
+                failed_clients.join(", ")
             )
         }
     }
@@ -2078,8 +2086,8 @@ impl ExecutionEngine {
     /// Starts the execution engine and all registered execution clients.
     pub fn start(&mut self) {
         for client in self.get_clients_mut() {
-            if let Err(e) = client.start() {
-                log::error!("{e}");
+            if client.start().is_err() {
+                log::error!("Failed to start execution client {}", client.client_id());
             }
         }
 
@@ -2096,8 +2104,8 @@ impl ExecutionEngine {
     /// sequence calls `stop()` more than once per run.
     pub fn stop(&mut self) {
         for client in self.get_clients_mut() {
-            if let Err(e) = client.stop() {
-                log::error!("{e}");
+            if client.stop().is_err() {
+                log::error!("Failed to stop execution client {}", client.client_id());
             }
         }
 
@@ -2110,8 +2118,8 @@ impl ExecutionEngine {
     /// Stops all registered execution clients without stopping the engine itself.
     pub fn stop_clients(&mut self) {
         for client in self.get_clients_mut() {
-            if let Err(e) = client.stop() {
-                log::error!("{e}");
+            if client.stop().is_err() {
+                log::error!("Failed to stop execution client {}", client.client_id());
             }
         }
     }
@@ -2122,14 +2130,13 @@ impl ExecutionEngine {
     /// other components on the shared clock untouched.
     pub fn reset(&mut self) {
         for client in self.get_clients_mut() {
-            if let Err(e) = client.reset() {
-                log::error!("{e}");
+            if client.reset().is_err() {
+                log::error!("Failed to reset execution client {}", client.client_id());
             }
         }
 
         self.cache.borrow_mut().reset();
         self.pos_id_generator.reset();
-        self.orders_dispatched.borrow_mut().clear();
 
         self.stop_snapshot_timer();
         self.stop_purge_timers();
@@ -2147,8 +2154,8 @@ impl ExecutionEngine {
     /// other components on the shared clock untouched.
     pub fn dispose(&mut self) {
         for client in self.get_clients_mut() {
-            if let Err(e) = client.dispose() {
-                log::error!("{e}");
+            if client.dispose().is_err() {
+                log::error!("Failed to dispose execution client {}", client.client_id());
             }
         }
 
@@ -2197,14 +2204,14 @@ impl ExecutionEngine {
             // The external client now owns the submitted orders, exactly like a registered client
             match &command {
                 TradingCommand::SubmitOrder(cmd) => {
-                    self.orders_dispatched
+                    self.cache
                         .borrow_mut()
-                        .insert(cmd.client_order_id);
+                        .mark_orders_dispatched([cmd.client_order_id]);
                 }
                 TradingCommand::SubmitOrderList(cmd) => {
-                    self.orders_dispatched
+                    self.cache
                         .borrow_mut()
-                        .extend(cmd.order_list.client_order_ids.iter().copied());
+                        .mark_orders_dispatched(cmd.order_list.client_order_ids.iter().copied());
                 }
                 _ => {}
             }
@@ -2322,10 +2329,9 @@ impl ExecutionEngine {
         )
     }
 
-    // The dispatch record is checked independently of the cache because the command is dispatched
-    // to an external client without the engine caching its orders (see the type-level documentation).
+    // External client dispatches are recorded even when their orders are not cached
     fn is_dispatched(&self, client_order_id: ClientOrderId) -> bool {
-        self.orders_dispatched.borrow().contains(&client_order_id)
+        self.cache.borrow().is_order_dispatched(&client_order_id)
     }
 
     // A cached order accepts a submit command only while it has a submittable status and has not
@@ -2587,7 +2593,9 @@ impl ExecutionEngine {
             return;
         }
 
-        self.orders_dispatched.borrow_mut().insert(client_order_id);
+        self.cache
+            .borrow_mut()
+            .mark_orders_dispatched([client_order_id]);
     }
 
     fn handle_submit_order_list(&self, client: &dyn ExecutionClient, cmd: SubmitOrderList) {
@@ -2743,7 +2751,11 @@ impl ExecutionEngine {
         log_info!("Submit {}", cmd.order_list, color = LogColor::Blue);
 
         if let Err(e) = client.submit_order_list(cmd) {
-            log::error!("Error submitting order list to client: {e}");
+            log::error!(
+                "Error submitting order list to client {}",
+                client.client_id()
+            );
+
             let reason = OrderDeniedReason::SubmitFailed {
                 detail: e.to_string(),
             }
@@ -2755,9 +2767,9 @@ impl ExecutionEngine {
             return;
         }
 
-        self.orders_dispatched
+        self.cache
             .borrow_mut()
-            .extend(orders.iter().map(Order::client_order_id));
+            .mark_orders_dispatched(orders.iter().map(Order::client_order_id));
     }
 
     fn add_order_from_init(
@@ -2804,14 +2816,22 @@ impl ExecutionEngine {
             color = LogColor::Blue
         );
 
-        if let Err(e) = client.modify_order(cmd) {
-            log::error!("Error modifying order: {e}");
+        let command_id = cmd.command_id;
+        if client.modify_order(cmd).is_err() {
+            log::error!(
+                "Error modifying order: client {}, command {command_id}",
+                client.client_id()
+            );
         }
     }
 
     fn handle_batch_modify_orders(&self, client: &dyn ExecutionClient, cmd: BatchModifyOrders) {
-        if let Err(e) = client.batch_modify_orders(cmd) {
-            log::error!("Error batch modifying orders: {e}");
+        let command_id = cmd.command_id;
+        if client.batch_modify_orders(cmd).is_err() {
+            log::error!(
+                "Error batch modifying orders: client {}, command {command_id}",
+                client.client_id()
+            );
         }
     }
 
@@ -2826,8 +2846,12 @@ impl ExecutionEngine {
             color = LogColor::Blue
         );
 
-        if let Err(e) = client.cancel_order(cmd) {
-            log::error!("Error canceling order: {e}");
+        let command_id = cmd.command_id;
+        if client.cancel_order(cmd).is_err() {
+            log::error!(
+                "Error canceling order: client {}, command {command_id}",
+                client.client_id()
+            );
         }
     }
 
@@ -2843,8 +2867,13 @@ impl ExecutionEngine {
 
         log_info!("Cancel all{side_str}orders", color = LogColor::Blue);
 
-        if let Err(e) = client.cancel_all_orders(venue_command) {
-            log::error!("Error canceling all orders: {e}");
+        let command_id = command.command_id;
+
+        if client.cancel_all_orders(venue_command).is_err() {
+            log::error!(
+                "Error canceling all orders: client {}, command {command_id}",
+                client.client_id()
+            );
         }
 
         msgbus::send_trading_command(
@@ -2990,24 +3019,36 @@ impl ExecutionEngine {
             color = LogColor::Blue
         );
 
-        if let Err(e) = client.batch_cancel_orders(cmd) {
-            log::error!("Error batch canceling orders: {e}");
+        let command_id = cmd.command_id;
+        if client.batch_cancel_orders(cmd).is_err() {
+            log::error!(
+                "Error batch canceling orders: client {}, command {command_id}",
+                client.client_id()
+            );
         }
     }
 
     fn handle_query_account(&self, client: &dyn ExecutionClient, cmd: QueryAccount) {
         log_info!("Query {}", cmd.account_id, color = LogColor::Blue);
 
-        if let Err(e) = client.query_account(cmd) {
-            log::warn!("Error querying account: {e}");
+        let command_id = cmd.command_id;
+        if client.query_account(cmd).is_err() {
+            log::warn!(
+                "Error querying account: client {}, command {command_id}",
+                client.client_id()
+            );
         }
     }
 
     fn handle_query_order(&self, client: &dyn ExecutionClient, cmd: QueryOrder) {
         log_info!("Query {}", cmd.client_order_id, color = LogColor::Blue);
 
-        if let Err(e) = client.query_order(cmd) {
-            log::warn!("Error querying order: {e}");
+        let command_id = cmd.command_id;
+        if client.query_order(cmd).is_err() {
+            log::warn!(
+                "Error querying order: client {}, command {command_id}",
+                client.client_id()
+            );
         }
     }
 
@@ -3580,7 +3621,21 @@ impl ExecutionEngine {
         order: Option<&OrderAny>,
     ) -> Option<PositionId> {
         let cache = self.cache.borrow();
-        let cached_position_id = cache.position_id(&fill.client_order_id()).copied();
+
+        let flip = match (oms_type == OmsType::Hedging)
+            .then(|| cache.hedging_flip_position_ids(fill.client_order_id))
+            .transpose()
+        {
+            Ok(flip) => flip.flatten(),
+            Err(e) => {
+                log::error!("Cannot route hedging fill {}: {e}", fill.trade_id);
+                return None;
+            }
+        };
+
+        let cached_position_id = flip
+            .map(|ids| ids[1])
+            .or_else(|| cache.position_id(&fill.client_order_id()).copied());
         drop(cache);
 
         if self.config.debug {
@@ -3595,17 +3650,19 @@ impl ExecutionEngine {
             && let Some(fill_position_id) = fill.position_id
             && cached_position_id != fill_position_id
         {
-            if oms_type == OmsType::Hedging {
-                if !self.is_flip_remainder(fill, cached_position_id, fill_position_id) {
-                    log::error!(
-                        "Cannot apply hedging fill {} for {}: venue position ID {fill_position_id} conflicts with cached position ID {cached_position_id}",
-                        fill.trade_id,
-                        fill.client_order_id(),
-                    );
+            if oms_type == OmsType::Hedging
+                && !flip.is_some_and(|ids| ids.contains(&fill_position_id))
+            {
+                log::error!(
+                    "Cannot apply hedging fill {} for {}: venue position ID {fill_position_id} conflicts with cached position ID {cached_position_id}",
+                    fill.trade_id,
+                    fill.client_order_id(),
+                );
 
-                    return None;
-                }
-            } else {
+                return None;
+            }
+
+            if oms_type != OmsType::Hedging {
                 log::warn!(
                     "Incorrect position ID assigned to fill: \
                      cached={cached_position_id}, assigned={fill_position_id}; \
@@ -3637,17 +3694,23 @@ impl ExecutionEngine {
             return None;
         }
 
+        self.index_exec_spawn_position(fill.client_order_id, order, position_id);
+
+        Some(position_id)
+    }
+
+    fn index_exec_spawn_position(
+        &self,
+        client_order_id: ClientOrderId,
+        order: Option<&OrderAny>,
+        position_id: PositionId,
+    ) {
         let order = if let Some(o) = order {
             o.clone()
         } else {
             let cache = self.cache.borrow();
-            cache.order(&fill.client_order_id()).map_or_else(
-                || {
-                    panic!(
-                        "Order for {} not found to determine position ID",
-                        fill.client_order_id()
-                    )
-                },
+            cache.order(&client_order_id).map_or_else(
+                || panic!("Order for {client_order_id} not found to determine position ID"),
                 |o| o.clone(),
             )
         };
@@ -3663,7 +3726,7 @@ impl ExecutionEngine {
                     "Primary exec spawn order {exec_spawn_id} not found, \
                      skipping position ID propagation"
                 );
-                return Some(position_id);
+                return;
             };
             let primary_already_indexed = cache.position_id(&primary.client_order_id()).is_some();
             drop(cache);
@@ -3681,8 +3744,6 @@ impl ExecutionEngine {
                 log::debug!("Assigned primary order {position_id}");
             }
         }
-
-        Some(position_id)
     }
 
     /// Returns whether `fill` may be applied to the position assigned to `position_id`.
@@ -3752,43 +3813,6 @@ impl ExecutionEngine {
         }
 
         true
-    }
-
-    /// Returns whether `fill` is a later fill of an order this engine already flipped.
-    ///
-    /// Flipping under `Hedging` closes the original virtual position with the reversing order
-    /// and opens a newly minted virtual position from the same order, moving the order's cache
-    /// index onto the new ID. Every later fill of that order still carries the original ID, so
-    /// the venue ID and the cached ID disagree for the rest of the order's life.
-    ///
-    /// The split is recognized from the two positions rather than from the order, because
-    /// applying a fill writes the determined ID onto the order and would erase the evidence for
-    /// the fill after it. Both halves must still name this order: the cached position was opened
-    /// by it, and the position the fill names was closed by it.
-    fn is_flip_remainder(
-        &self,
-        fill: &OrderFilled,
-        cached_position_id: PositionId,
-        fill_position_id: PositionId,
-    ) -> bool {
-        if !cached_position_id.is_virtual() || !fill_position_id.is_virtual() {
-            return false;
-        }
-
-        let cache = self.cache.borrow();
-        let client_order_id = fill.client_order_id();
-
-        let opened_by_order = cache
-            .position_ref(&cached_position_id)
-            .is_some_and(|flipped| flipped.opening_order_id == client_order_id);
-
-        let closed_by_order = cache
-            .position_ref(&fill_position_id)
-            .is_some_and(|original| {
-                original.is_closed() && original.closing_order_id == Some(client_order_id)
-            });
-
-        opened_by_order && closed_by_order
     }
 
     fn determine_hedging_position_id(
@@ -4027,7 +4051,9 @@ impl ExecutionEngine {
 
         // The client's first status transition closes the dispatch window
         if !Self::has_submittable_status(&order) {
-            self.orders_dispatched.borrow_mut().remove(&client_order_id);
+            self.cache
+                .borrow_mut()
+                .clear_order_dispatch(&client_order_id);
         }
 
         if self.config.manage_own_order_books && should_handle_own_book_order(&order) {
@@ -4734,7 +4760,8 @@ impl ExecutionEngine {
                 &position,
                 oms_type,
                 !is_orderless_leg,
-                self.config.carry_replay_events_on_reopen,
+                self.config.carry_replay_events_on_reopen
+                    || (oms_type == OmsType::Hedging && position_id.is_virtual()),
             )?;
         } else if is_orderless_leg {
             self.cache

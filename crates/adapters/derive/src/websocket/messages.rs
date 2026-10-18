@@ -27,7 +27,7 @@ use std::{
 
 #[cfg(test)]
 use nautilus_core::string::secret::REDACTED;
-use nautilus_core::string::secret::SecretString;
+use nautilus_core::{serialization::deserialize_decimal_token, string::secret::SecretString};
 use nautilus_model::identifiers::InstrumentId;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,7 @@ use crate::{
         enums::{
             DeriveInstrumentType, DeriveOrderbookDepth, DeriveOrderbookGroup, DeriveTickerInterval,
         },
-        parse::{deserialize_decimal, format_instrument_id, salvage_rows},
+        parse::{format_instrument_id, salvage_rows},
     },
     http::models::{
         DeriveAggregateTradingStats, DeriveOptionPricing, DeriveOrder, DerivePublicTrade,
@@ -394,10 +394,10 @@ pub struct WsSubscriptionPayload {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 pub struct DeriveOrderbookLevel(
     /// Price level.
-    #[serde(deserialize_with = "deserialize_decimal")]
+    #[serde(deserialize_with = "deserialize_decimal_token")]
     pub Decimal,
     /// Aggregated amount at the price level.
-    #[serde(deserialize_with = "deserialize_decimal")]
+    #[serde(deserialize_with = "deserialize_decimal_token")]
     pub Decimal,
 );
 
@@ -433,7 +433,7 @@ impl DeriveOrderbookData {
     ///
     /// # Errors
     ///
-    /// Returns an error when the venue symbol is empty or contains only whitespace.
+    /// Returns an error if the venue symbol is empty or contains only whitespace.
     pub fn instrument_id(&self) -> anyhow::Result<InstrumentId> {
         format_instrument_id(self.instrument_name)
     }
@@ -718,8 +718,7 @@ impl DeriveTickerData {
     ///
     /// # Errors
     ///
-    /// Returns an error when a compact ticker is received on an invalid
-    /// channel.
+    /// Returns an error if a compact ticker is received on an invalid channel.
     pub fn apply_channel_context(&mut self, channel: &str) -> Result<(), String> {
         let Self::SlimEnvelope {
             instrument_ticker, ..
@@ -742,7 +741,7 @@ impl DeriveTickerData {
     ///
     /// # Errors
     ///
-    /// Returns an error when the venue symbol is empty or contains only whitespace.
+    /// Returns an error if the venue symbol is empty or contains only whitespace.
     pub fn instrument_id(&self) -> anyhow::Result<InstrumentId> {
         format_instrument_id(self.instrument_name())
     }
@@ -832,7 +831,7 @@ impl DeriveWsFrame {
     ///
     /// # Errors
     ///
-    /// Returns [`serde_json::Error`] when `text` is not valid JSON.
+    /// Returns an error if `text` is not valid JSON.
     pub fn parse(text: &str) -> serde_json::Result<Self> {
         match parse_frame(text)? {
             ParsedFrame::Response { id, result, error } => Ok(Self::Response { id, result, error }),

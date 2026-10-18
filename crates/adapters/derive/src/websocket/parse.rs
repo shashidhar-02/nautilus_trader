@@ -50,8 +50,8 @@ use crate::{
 ///
 /// # Errors
 ///
-/// Returns an error when the channel is unsupported or `params.data` does not
-/// match the channel payload shape.
+/// Returns an error if the channel is unsupported or `params.data` does not match the channel
+/// payload shape.
 pub fn parse_public_ws_data(payload: &WsSubscriptionPayload) -> anyhow::Result<DerivePublicWsData> {
     let channel = payload.channel.as_str();
     if channel.starts_with("orderbook.") {
@@ -73,7 +73,7 @@ pub fn parse_public_ws_data(payload: &WsSubscriptionPayload) -> anyhow::Result<D
 ///
 /// # Errors
 ///
-/// Returns an error when `params.data` is not a Derive order book snapshot.
+/// Returns an error if `params.data` is not a Derive order book snapshot.
 pub fn parse_orderbook_msg(payload: &WsSubscriptionPayload) -> anyhow::Result<DeriveOrderbookMsg> {
     let data = serde_json::from_str::<DeriveOrderbookData>(payload.data.get())
         .context("failed to decode Derive orderbook data")?;
@@ -87,7 +87,7 @@ pub fn parse_orderbook_msg(payload: &WsSubscriptionPayload) -> anyhow::Result<De
 ///
 /// # Errors
 ///
-/// Returns an error when `params.data` is not a list of Derive public trades.
+/// Returns an error if `params.data` is not a list of Derive public trades.
 pub fn parse_trades_msg(payload: &WsSubscriptionPayload) -> anyhow::Result<DeriveTradesMsg> {
     let trades = serde_json::from_str::<Vec<DerivePublicTrade>>(payload.data.get())
         .context("failed to decode Derive trades data")?;
@@ -101,7 +101,7 @@ pub fn parse_trades_msg(payload: &WsSubscriptionPayload) -> anyhow::Result<Deriv
 ///
 /// # Errors
 ///
-/// Returns an error when `params.data` is not a Derive ticker payload.
+/// Returns an error if `params.data` is not a Derive ticker payload.
 pub fn parse_ticker_msg(payload: &WsSubscriptionPayload) -> anyhow::Result<DeriveTickerMsg> {
     let mut data = serde_json::from_str::<DeriveTickerData>(payload.data.get())
         .context("failed to decode Derive ticker data")?;
@@ -125,7 +125,7 @@ pub fn parse_ticker_msg(payload: &WsSubscriptionPayload) -> anyhow::Result<Deriv
 ///
 /// # Errors
 ///
-/// Returns an error when a price, size, or timestamp cannot be converted.
+/// Returns an error if a price, size, or timestamp cannot be converted.
 pub fn parse_orderbook_deltas(
     msg: &DeriveOrderbookMsg,
     price_precision: u8,
@@ -194,7 +194,7 @@ pub fn parse_orderbook_deltas(
 ///
 /// # Errors
 ///
-/// Returns an error when a price, size, or timestamp cannot be converted.
+/// Returns an error if a price, size, or timestamp cannot be converted.
 pub fn parse_orderbook_depth(
     msg: &DeriveOrderbookMsg,
     price_precision: u8,
@@ -252,7 +252,7 @@ pub fn parse_orderbook_depth(
 ///
 /// # Errors
 ///
-/// Returns an error when trade identifier, price, size, or timestamp conversion fails.
+/// Returns an error if trade identifier, price, size, or timestamp conversion fails.
 pub fn parse_trade_tick(
     trade: &DerivePublicTrade,
     price_precision: u8,
@@ -274,7 +274,7 @@ pub fn parse_trade_tick(
 ///
 /// # Errors
 ///
-/// Returns an error when trade identifier, price, size, or timestamp conversion fails.
+/// Returns an error if trade identifier, price, size, or timestamp conversion fails.
 pub fn parse_trade_tick_from_rest(
     trade: &DerivePublicTrade,
     price_precision: u8,
@@ -338,7 +338,7 @@ fn build_trade_tick(
 ///
 /// # Errors
 ///
-/// Returns an error when price, size, or timestamp conversion fails.
+/// Returns an error if price, size, or timestamp conversion fails.
 pub fn parse_ticker_quote(
     msg: &DeriveTickerMsg,
     price_precision: u8,
@@ -374,7 +374,7 @@ pub fn parse_ticker_quote(
 ///
 /// # Errors
 ///
-/// Returns an error when price, size, or timestamp conversion fails.
+/// Returns an error if price, size, or timestamp conversion fails.
 pub fn parse_ticker_quote_from_rest(
     ticker: &DeriveTickerSnapshot,
     price_precision: u8,
@@ -500,7 +500,7 @@ pub(crate) fn ticker_ts_event(timestamp_ms: i64) -> anyhow::Result<UnixNanos> {
 ///
 /// # Errors
 ///
-/// Returns an error when the ticker timestamp is negative or overflows.
+/// Returns an error if the ticker timestamp is negative or overflows.
 pub fn parse_mark_price(
     msg: &DeriveTickerMsg,
     price_precision: u8,
@@ -522,7 +522,7 @@ pub fn parse_mark_price(
 ///
 /// # Errors
 ///
-/// Returns an error when the ticker timestamp is negative or overflows.
+/// Returns an error if the ticker timestamp is negative or overflows.
 pub fn parse_index_price(
     msg: &DeriveTickerMsg,
     price_precision: u8,
@@ -546,7 +546,7 @@ pub fn parse_index_price(
 ///
 /// # Errors
 ///
-/// Returns an error when the ticker timestamp is negative or overflows.
+/// Returns an error if the ticker timestamp is negative or overflows.
 pub fn parse_funding_rate(
     msg: &DeriveTickerMsg,
     ts_init: UnixNanos,
@@ -571,7 +571,7 @@ pub fn parse_funding_rate(
 ///
 /// # Errors
 ///
-/// Returns an error when the record timestamp is negative or overflows.
+/// Returns an error if the record timestamp is negative or overflows.
 pub fn parse_funding_rate_history_record(
     record: &DerivePublicFundingRate,
     instrument_id: InstrumentId,
@@ -598,7 +598,7 @@ pub fn parse_funding_rate_history_record(
 ///
 /// # Errors
 ///
-/// Returns an error when price, size, or timestamp conversion fails.
+/// Returns an error if price, size, or timestamp conversion fails.
 pub fn parse_candle_record(
     record: &DerivePublicCandle,
     bar_type: BarType,
@@ -686,7 +686,7 @@ fn timestamp_seconds_to_nanos(value: u64, field: &str) -> anyhow::Result<UnixNan
 ///
 /// # Errors
 ///
-/// Returns an error when the ticker timestamp is negative or overflows.
+/// Returns an error if the ticker timestamp is negative or overflows.
 pub fn parse_option_greeks(
     msg: &DeriveTickerMsg,
     ts_init: UnixNanos,
@@ -862,6 +862,37 @@ mod tests {
         assert_eq!(
             deltas.deltas[3].flags,
             RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
+        );
+    }
+
+    #[rstest]
+    #[case::null_price(0, Value::Null)]
+    #[case::empty_price(0, json!(""))]
+    #[case::null_amount(1, Value::Null)]
+    #[case::empty_amount(1, json!(""))]
+    fn test_parse_orderbook_rejects_missing_numeric_values(
+        #[case] field: usize,
+        #[case] value: Value,
+        #[values("bids", "asks")] side: &str,
+        #[values(false, true)] depth: bool,
+    ) {
+        let mut data = load_json("perps/ws_orderbook_eth.json");
+        data[side][0][field] = value;
+        let payload = subscription_data_payload("orderbook.ETH-PERP.1.10", &data);
+
+        let result = parse_orderbook_msg(&payload).and_then(|msg| {
+            if depth {
+                parse_orderbook_depth(&msg, PRICE_PRECISION, SIZE_PRECISION, UnixNanos::from(123))
+                    .map(|_| ())
+            } else {
+                parse_orderbook_deltas(&msg, PRICE_PRECISION, SIZE_PRECISION, UnixNanos::from(123))
+                    .map(|_| ())
+            }
+        });
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "failed to decode Derive orderbook data"
         );
     }
 

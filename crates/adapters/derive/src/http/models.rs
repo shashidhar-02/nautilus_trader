@@ -617,8 +617,8 @@ impl DeriveReplaceResult {
     ///
     /// # Errors
     ///
-    /// Returns an error for contradictory fields, an unexpected cancellation record, or an
-    /// invalid replacement state.
+    /// Returns an error if fields contradict each other, a cancellation record is unexpected, or
+    /// the replacement state is invalid.
     pub(crate) fn into_outcome(
         self,
         expected_cancel_order_id: &str,
@@ -753,7 +753,7 @@ pub struct DerivePosition {
     /// Signed position amount; positive = long, negative = short.
     #[serde(deserialize_with = "deserialize_decimal_token")]
     pub amount: Decimal,
-    /// Average entry price over the lifetime of the position.
+    /// Average entry price over the lifetime of the position; includes opening fees for perpetuals.
     #[serde(deserialize_with = "deserialize_decimal_token")]
     pub average_price: Decimal,
     /// Position opening timestamp (UNIX ms).
