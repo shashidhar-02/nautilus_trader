@@ -49,7 +49,8 @@ use nautilus_common::{
         data::{
             RequestBookSnapshot, RequestInstrument, RequestInstruments, RequestTrades,
             SubscribeBookDepth, SubscribeCustomData, SubscribeInstrument, SubscribeInstrumentClose,
-            SubscribeInstrumentStatus, SubscribeQuotes, UnsubscribeInstrument,
+            SubscribeInstrumentStatus, SubscribeQuotes, SubscribeTrades, UnsubscribeInstrument,
+            UnsubscribeQuotes, UnsubscribeTrades,
         },
         system::SocketState,
     },
@@ -347,11 +348,15 @@ fn create_router(state: TestServerState) -> Router {
 }
 
 fn crypto_twap_data_type(symbol: &str, window_seconds: u64) -> DataType {
-    let mut metadata = Params::new();
-    metadata.insert("symbol".to_string(), Value::String(symbol.to_string()));
-    metadata.insert(
-        "window_seconds".to_string(),
-        Value::Number(window_seconds.into()),
+    let metadata = Params::new(
+        [
+            ("symbol".to_string(), Value::String(symbol.to_string())),
+            (
+                "window_seconds".to_string(),
+                Value::Number(window_seconds.into()),
+            ),
+        ]
+        .into(),
     );
     DataType::new("PolymarketCryptoTwap", Some(metadata), None)
 }
@@ -509,8 +514,7 @@ async fn test_subscribe_reference_price_authenticates_sends_exact_channel_and_em
     let data_type = match window_seconds {
         Some(window) => crypto_twap_data_type(symbol, window),
         None => {
-            let mut metadata = Params::new();
-            metadata.insert("symbol".to_string(), json!(symbol));
+            let metadata = Params::new([("symbol".to_string(), json!(symbol))].into());
             DataType::new(type_name, Some(metadata), None)
         }
     };
@@ -671,7 +675,8 @@ fn create_test_data_client_with_resolution_options(
         clob_public,
         data_api,
         ws,
-    );
+    )
+    .unwrap();
 
     (client, rx)
 }
@@ -757,11 +762,11 @@ async fn test_request_instrument_fetches_fresh_definition() {
 
     let publish_count = events
         .iter()
-        .filter(|e| matches!(e, DataEvent::Instrument(_)))
+        .filter(|e| matches!(e, DataEvent::Data(NautilusData::Instrument(_))))
         .count();
     assert_eq!(
         publish_count, 1,
-        "request_instrument must publish exactly one DataEvent::Instrument; events were: {events:?}"
+        "request_instrument must publish exactly one DataEvent::Data(NautilusData::Instrument(...)); events were: {events:?}"
     );
 
     let response_count = events
@@ -845,7 +850,7 @@ async fn test_subscribe_instrument_does_not_replay_cached_definition() {
     assert_eq!(
         prime_events
             .iter()
-            .filter(|event| matches!(event, DataEvent::Instrument(_)))
+            .filter(|event| matches!(event, DataEvent::Data(NautilusData::Instrument(_))))
             .count(),
         1,
     );
@@ -1037,7 +1042,7 @@ async fn test_request_instruments_emits_response() {
 
     let publish_count = events
         .iter()
-        .filter(|e| matches!(e, DataEvent::Instrument(_)))
+        .filter(|e| matches!(e, DataEvent::Data(NautilusData::Instrument(_))))
         .count();
     assert_eq!(
         publish_count, 0,
@@ -1207,7 +1212,8 @@ async fn test_request_trades_returns_trades_response() {
         .unwrap_or_else(|| panic!("expected DataResponse::Trades; events were: {events:?}"));
 
     assert_eq!(
-        trades_response.instrument_id, instrument_id,
+        trades_response.instrument_ids,
+        vec![instrument_id],
         "response must carry the requested instrument_id",
     );
     assert_eq!(
@@ -1355,7 +1361,7 @@ async fn test_request_trades_emits_one_empty_response_for_empty_result() {
         1,
         "an empty Data API result must emit exactly one correlated trades response; events were: {events:?}",
     );
-    assert_eq!(trades_responses[0].instrument_id, instrument_id);
+    assert_eq!(trades_responses[0].instrument_ids, vec![instrument_id]);
     assert!(trades_responses[0].data.is_empty());
 }
 
@@ -1510,4 +1516,118 @@ async fn test_reset_reconnect_does_not_replay_stale_market_subscriptions() {
     wait_for_market_payload_count(&state, 2, false, Duration::from_secs(5)).await;
 
     client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_quote_list_admits_both_tokens_through_debounced_gamma_loader() {
+    let state = TestServerState::default();
+    let market = gamma_market_request_fixture();
+    let tokens: Vec<String> =
+        serde_json::from_str(market["clobTokenIds"].as_str().unwrap()).unwrap();
+    assert_eq!(tokens.len(), 2);
+    let ids: Vec<_> = tokens
+        .iter()
+        .map(|token| InstrumentId::from(format!("{TEST_CONDITION_ID}-{token}.POLYMARKET").as_str()))
+        .collect();
+    *state.gamma_response.lock().await = Some(json!([market]));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _data_rx) = create_test_data_client(addr);
+    client.connect().await.unwrap();
+
+    let command = SubscribeQuotes::new(
+        ids,
+        Some(*POLYMARKET_CLIENT_ID),
+        None,
+        UUID4::new(),
+        UnixNanos::from(17),
+        Some(UUID4::new()),
+        None,
+    );
+    client.subscribe_quotes(command.clone()).unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            let tokens = tokens.clone();
+            async move {
+                let payloads = state.market_payloads.lock().await;
+                tokens.iter().all(|token| {
+                    payloads.iter().any(|payload| {
+                        payload["assets_ids"]
+                            .as_array()
+                            .is_some_and(|ids| ids.contains(&json!(token)))
+                    })
+                })
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(state.gamma_request_count.load(Ordering::Relaxed), 1);
+
+    client
+        .subscribe_trades(SubscribeTrades::new(
+            command.instrument_ids[0],
+            command.client_id,
+            command.venue,
+            UUID4::new(),
+            UnixNanos::from(19),
+            None,
+            None,
+        ))
+        .unwrap();
+
+    let release = UnsubscribeQuotes::new(
+        command.instrument_ids,
+        command.client_id,
+        command.venue,
+        UUID4::new(),
+        UnixNanos::from(23),
+        command.correlation_id,
+        command.params,
+    );
+    client.unsubscribe_quotes(&release).unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            let tokens = tokens.clone();
+            async move {
+                let payloads = state.market_payloads.lock().await;
+                tokens[1..].iter().all(|token| {
+                    payloads.iter().any(|payload| {
+                        payload["operation"] == "unsubscribe"
+                            && payload["assets_ids"]
+                                .as_array()
+                                .is_some_and(|ids| ids.contains(&json!(token)))
+                    })
+                })
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let released: Vec<_> = state
+        .market_payloads
+        .lock()
+        .await
+        .iter()
+        .filter(|payload| payload["operation"] == "unsubscribe")
+        .flat_map(|payload| payload["assets_ids"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(released, vec![json!(tokens[1])]);
+    client
+        .unsubscribe_trades(&UnsubscribeTrades::new(
+            release.instrument_ids[0],
+            release.client_id,
+            release.venue,
+            UUID4::new(),
+            UnixNanos::from(29),
+            None,
+            None,
+        ))
+        .unwrap();
+    client.disconnect().await.unwrap();
+    assert!(client.is_disconnected());
 }

@@ -18,6 +18,7 @@
 use std::{convert::TryFrom, str::FromStr};
 
 use anyhow::Context;
+use indexmap::IndexMap;
 pub use nautilus_core::serialization::{
     deserialize_decimal_or_zero, deserialize_optional_decimal_or_zero,
     deserialize_optional_decimal_str, deserialize_string_to_u8,
@@ -409,6 +410,7 @@ pub fn parse_spot_instrument(
         "margin_trading".to_string(),
         serde_json::Value::Bool(margin_trading_supported),
     );
+    let info = Params::new(info);
 
     let asset_class = definition
         .symbol_type
@@ -531,7 +533,8 @@ pub fn parse_linear_instrument(
         None,
         definition.full_name.as_deref(),
         definition.market_region.as_deref(),
-    );
+    )
+    .map(Params::new);
 
     let asset_class = definition
         .symbol_type
@@ -718,7 +721,7 @@ pub fn parse_inverse_instrument(
         "lotSizeFilter.minNotionalValue",
     )?;
 
-    let info = build_instrument_info(definition.symbol_type, None, None, None);
+    let info = build_instrument_info(definition.symbol_type, None, None, None).map(Params::new);
 
     match definition.contract_type {
         BybitContractType::InversePerpetual => {
@@ -790,14 +793,13 @@ fn build_instrument_info(
     xstock_multiplier: Option<&str>,
     full_name: Option<&str>,
     market_region: Option<&str>,
-) -> Option<Params> {
+) -> Option<IndexMap<String, serde_json::Value>> {
     let symbol_type = symbol_type?;
     let value = symbol_type.as_str()?;
-    let mut info = Params::new();
-    info.insert(
+    let mut info = IndexMap::from([(
         "symbol_type".to_string(),
         serde_json::Value::String(value.to_string()),
-    );
+    )]);
 
     if symbol_type == BybitSymbolType::Xstocks
         && let Some(multiplier) = xstock_multiplier.filter(|value| !value.is_empty())
@@ -1701,12 +1703,25 @@ pub fn trigger_direction(
 
 /// Maps Nautilus time-in-force to Bybit's TIF.
 ///
-/// Returns `Err(tif)` with the unsupported value for caller-specific error wrapping.
+/// GTD maps to GTC. Market orders omit TIF; post-only limit orders use `PostOnly`.
+///
+/// # Errors
+///
+/// Returns an error if the time in force is unsupported, including for market and post-only orders.
+/// The error contains the unsupported value.
 pub fn map_time_in_force(
     order_type: BybitOrderType,
     time_in_force: Option<TimeInForce>,
     post_only: Option<bool>,
 ) -> Result<Option<BybitTimeInForce>, TimeInForce> {
+    let mapped = match time_in_force {
+        Some(TimeInForce::Gtc | TimeInForce::Gtd) => Some(BybitTimeInForce::Gtc),
+        Some(TimeInForce::Ioc) => Some(BybitTimeInForce::Ioc),
+        Some(TimeInForce::Fok) => Some(BybitTimeInForce::Fok),
+        Some(tif) => return Err(tif),
+        None => None,
+    };
+
     if order_type == BybitOrderType::Market {
         return Ok(None);
     }
@@ -1715,13 +1730,7 @@ pub fn map_time_in_force(
         return Ok(Some(BybitTimeInForce::PostOnly));
     }
 
-    match time_in_force {
-        Some(TimeInForce::Gtc) => Ok(Some(BybitTimeInForce::Gtc)),
-        Some(TimeInForce::Ioc) => Ok(Some(BybitTimeInForce::Ioc)),
-        Some(TimeInForce::Fok) => Ok(Some(BybitTimeInForce::Fok)),
-        Some(tif) => Err(tif),
-        None => Ok(None),
-    }
+    Ok(mapped)
 }
 
 /// Converts an optional `UnixNanos` timestamp to optional milliseconds.
@@ -2085,6 +2094,42 @@ mod tests {
         let response: BybitInstrumentLinearResponse = serde_json::from_str(&json).unwrap();
         let instrument = &response.result.list[0];
         parse_linear_instrument(instrument, TS, TS).unwrap()
+    }
+
+    #[rstest]
+    fn test_map_time_in_force_rejects_unsupported(
+        #[values(BybitOrderType::Market, BybitOrderType::Limit)] order_type: BybitOrderType,
+        #[values(None, Some(false), Some(true))] post_only: Option<bool>,
+        #[values(TimeInForce::Day, TimeInForce::AtTheOpen, TimeInForce::AtTheClose)]
+        tif: TimeInForce,
+    ) {
+        assert_eq!(
+            map_time_in_force(order_type, Some(tif), post_only),
+            Err(tif)
+        );
+    }
+
+    #[rstest]
+    #[case(Some(TimeInForce::Gtc), Some(BybitTimeInForce::Gtc))]
+    #[case(Some(TimeInForce::Gtd), Some(BybitTimeInForce::Gtc))]
+    #[case(Some(TimeInForce::Ioc), Some(BybitTimeInForce::Ioc))]
+    #[case(Some(TimeInForce::Fok), Some(BybitTimeInForce::Fok))]
+    #[case(None, None)]
+    fn test_map_time_in_force_preserves_supported(
+        #[case] tif: Option<TimeInForce>,
+        #[case] expected: Option<BybitTimeInForce>,
+        #[values(BybitOrderType::Market, BybitOrderType::Limit)] order_type: BybitOrderType,
+        #[values(None, Some(false), Some(true))] post_only: Option<bool>,
+    ) {
+        let expected = if order_type == BybitOrderType::Market {
+            None
+        } else if post_only == Some(true) {
+            Some(BybitTimeInForce::PostOnly)
+        } else {
+            expected
+        };
+
+        assert_eq!(map_time_in_force(order_type, tif, post_only), Ok(expected));
     }
 
     #[rstest]
@@ -2688,11 +2733,12 @@ mod tests {
     }
 
     fn params_from(pairs: &[(&str, serde_json::Value)]) -> Params {
-        let mut p = Params::new();
-        for (k, v) in pairs {
-            p.insert(k.to_string(), v.clone());
-        }
-        p
+        Params::new(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
     }
 
     #[rstest]
@@ -2707,7 +2753,7 @@ mod tests {
 
     #[rstest]
     fn test_parse_tp_sl_params_empty_returns_defaults() {
-        let p = Params::new();
+        let p = Params::empty();
         let result = parse_bybit_tp_sl_params(Some(&p)).unwrap();
         assert!(!result.is_leverage);
         assert!(!result.has_tp_sl());

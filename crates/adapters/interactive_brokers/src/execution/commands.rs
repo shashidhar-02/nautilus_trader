@@ -10,6 +10,7 @@
 //! Interactive Brokers execution command handling.
 
 use nautilus_common::live::sender::EventSender;
+use nautilus_model::events::OrderDeniedReason;
 
 use super::{
     core::*,
@@ -129,8 +130,11 @@ impl InteractiveBrokersExecutionClient {
         order_submit_lock: &'a Arc<tokio::sync::Mutex<()>>,
     ) -> anyhow::Result<Option<PreparedOrder<'a>>> {
         if cmd.order_init.post_only {
-            let detail = "`post_only` not supported by Interactive Brokers";
-            let reason = coded_denial_reason(DENIAL_POST_ONLY_UNSUPPORTED, detail);
+            let reason = OrderDeniedReason::unsupported_post_only_with_detail(
+                "`post_only` not supported by Interactive Brokers",
+            )
+            .to_string();
+
             return Self::deny_awaiting_order(cmd, &reason, orders, exec_sender, clock);
         }
 
@@ -139,8 +143,11 @@ impl InteractiveBrokersExecutionClient {
             .is_some_and(|instrument| instrument.is_inverse());
 
         if cmd.order_init.quote_quantity && !is_inverse {
-            let detail = "Quote quantity requires an inverse instrument";
-            let reason = coded_denial_reason(DENIAL_QUOTE_QUANTITY_UNSUPPORTED, detail);
+            let reason = OrderDeniedReason::unsupported_quote_quantity_with_detail(
+                "Quote quantity requires an inverse instrument",
+            )
+            .to_string();
+
             return Self::deny_awaiting_order(cmd, &reason, orders, exec_sender, clock);
         }
 
@@ -699,7 +706,7 @@ impl InteractiveBrokersExecutionClient {
         ) {
             Ok(prepared) => prepared,
             Err(e) => {
-                let reason = coded_denial_reason(DENIAL_ORDER_LIST_INVALID, &format!("{e:#}"));
+                let reason = preparation_denial_reason(DENIAL_ORDER_LIST_INVALID, &e);
                 Self::deny_awaiting_order_list(
                     orders,
                     &reason,
@@ -977,7 +984,7 @@ impl InteractiveBrokersExecutionClient {
         exec_sender: &EventSender<ExecutionEvent>,
         clock: &'static AtomicTime,
     ) -> anyhow::Result<Option<T>> {
-        let reason = coded_denial_reason(DENIAL_ORDER_INVALID, &format!("{error:#}"));
+        let reason = preparation_denial_reason(DENIAL_ORDER_INVALID, error);
         Self::deny_awaiting_order(cmd, &reason, orders, exec_sender, clock)
     }
 
@@ -1078,6 +1085,13 @@ impl InteractiveBrokersExecutionClient {
     }
 }
 
+fn preparation_denial_reason(code: &str, error: &anyhow::Error) -> String {
+    match error.downcast_ref::<OrderDeniedReason>() {
+        Some(reason) => reason.to_string(),
+        None => coded_denial_reason(code, &format!("{error:#}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_core::Params;
@@ -1106,9 +1120,12 @@ mod tests {
     }
 
     fn instrument_provider() -> Arc<InteractiveBrokersInstrumentProvider> {
-        Arc::new(InteractiveBrokersInstrumentProvider::new(
-            InteractiveBrokersInstrumentProviderConfig::default(),
-        ))
+        Arc::new(
+            InteractiveBrokersInstrumentProvider::new(
+                InteractiveBrokersInstrumentProviderConfig::default(),
+            )
+            .unwrap(),
+        )
     }
 
     #[rstest::rstest]
@@ -1128,11 +1145,8 @@ mod tests {
         };
 
         let mut cmd = modify_trigger_cmd();
-        cmd.params = trailing_offset.map(|offset| {
-            let mut params = Params::new();
-            params.insert(MODIFY_TRAILING_OFFSET_PARAM.to_string(), offset);
-            params
-        });
+        cmd.params = trailing_offset
+            .map(|offset| Params::new([(MODIFY_TRAILING_OFFSET_PARAM.to_string(), offset)].into()));
 
         InteractiveBrokersExecutionClient::apply_modify_fields_to_ib_order(
             &cmd,
@@ -1234,8 +1248,8 @@ mod tests {
         let mut cmd = modify_trigger_cmd();
         cmd.instrument_id = InstrumentId::from("AAPL.XNAS");
         cmd.trigger_price = Some(Price::from("4.8125"));
-        let mut params = Params::new();
-        params.insert(MODIFY_TRAILING_OFFSET_PARAM.to_string(), trailing_offset);
+        let params =
+            Params::new([(MODIFY_TRAILING_OFFSET_PARAM.to_string(), trailing_offset)].into());
         cmd.params = Some(params);
 
         InteractiveBrokersExecutionClient::apply_modify_fields_to_ib_order(

@@ -30,13 +30,13 @@ use nautilus_core::Params;
 use nautilus_live::{ExecutionClientCore, execution::failure::CommandFailure};
 use nautilus_model::{
     enums::{AccountType, AssetClass, OmsType, OrderSide, OrderType, PositionSide},
-    events::OrderInitialized,
+    events::{OrderDeniedReason, OrderInitialized},
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId,
         Venue, VenueOrderId,
     },
     instruments::{
-        FuturesContract, InstrumentAny, OptionSpread,
+        CurrencyPair, FuturesContract, InstrumentAny, OptionSpread,
         stubs::{equity_aapl, equity_aapl_itch},
     },
     orders::{OrderList, builder::OrderTestBuilder},
@@ -53,7 +53,10 @@ use crate::{
     common::consts::{IB_CLIENT_ID, IB_VENUE},
     config::InteractiveBrokersInstrumentProviderConfig,
     execution::{
-        account::check_external_position_change, parse::FillEvidence, reports::FillReportCollector,
+        account::check_external_position_change,
+        parse::FillEvidence,
+        reports::FillReportCollector,
+        updates::{OrderUpdateLoopOutcome, RebindDelays},
     },
     stubs::ChannelSubscription,
 };
@@ -62,7 +65,7 @@ const NATIVE_CLIENT_ID: i32 = 1;
 
 fn create_test_instrument_provider() -> Arc<InteractiveBrokersInstrumentProvider> {
     let config = InteractiveBrokersInstrumentProviderConfig::default();
-    Arc::new(InteractiveBrokersInstrumentProvider::new(config))
+    Arc::new(InteractiveBrokersInstrumentProvider::new(config).unwrap())
 }
 
 fn create_test_execution_client() -> (
@@ -1873,10 +1876,12 @@ fn modify_changes_only_requested_fields_of_the_open_order(
         ..Default::default()
     };
 
-    let mut params = Params::new();
-    params.insert(
-        MODIFY_TRAILING_OFFSET_PARAM.to_string(),
-        serde_json::json!(2.5),
+    let params = Params::new(
+        [(
+            MODIFY_TRAILING_OFFSET_PARAM.to_string(),
+            serde_json::json!(2.5),
+        )]
+        .into(),
     );
 
     let cmd = ModifyOrder::new(
@@ -2172,7 +2177,87 @@ fn list_submit_failure_denies_every_unsubmitted_tail_order() {
 }
 
 #[rstest]
-fn unpreparable_order_is_denied_with_coded_reason() {
+#[case::post_only(
+    true,
+    false,
+    "UNSUPPORTED_POST_ONLY: `post_only` not supported by Interactive Brokers"
+)]
+#[case::quote_quantity(
+    false,
+    true,
+    "UNSUPPORTED_QUOTE_QUANTITY: Quote quantity requires an inverse instrument"
+)]
+#[tokio::test]
+async fn prepare_order_denies_unsupported_instruction_with_detail(
+    #[case] post_only: bool,
+    #[case] quote_quantity: bool,
+    #[case] expected_reason: &str,
+) {
+    let (client, mut rx, _cache) = create_test_execution_client();
+    *client.next_order_id.lock() = 100;
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(InstrumentId::from("AAPL.XNAS"))
+        .client_order_id(ClientOrderId::from("O-UNSUPPORTED-DETAIL"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .price(Price::from("100.00"))
+        .post_only(post_only)
+        .quote_quantity(quote_quantity)
+        .build();
+    let cmd = SubmitOrder::from_order(
+        &order,
+        client.core.trader_id,
+        Some(client.core.client_id),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+    InteractiveBrokersExecutionClient::register_awaiting_submission(
+        order.client_order_id(),
+        awaiting_submission(&order),
+        &client.orders,
+    )
+    .unwrap();
+    let exec_sender = get_exec_event_sender();
+    let result = InteractiveBrokersExecutionClient::prepare_submit_order(
+        &cmd,
+        async { panic!("denied order must not request a price magnifier") },
+        &client.orders,
+        &client.next_order_id,
+        &client.instrument_provider,
+        &exec_sender,
+        get_atomic_clock_realtime(),
+        client.ib_account,
+        &client.order_submit_lock,
+    )
+    .await;
+
+    assert_eq!(result.err().unwrap().to_string(), expected_reason);
+
+    match next_order_event(&mut rx) {
+        OrderEventAny::Denied(event) => {
+            assert_eq!(event.client_order_id, order.client_order_id());
+            assert_eq!(event.reason.as_str(), expected_reason);
+        }
+        event => panic!("Expected OrderDenied, was {event:?}"),
+    }
+
+    assert_eq!(
+        rx.try_recv().unwrap_err(),
+        tokio::sync::mpsc::error::TryRecvError::Empty
+    );
+    assert!(client.orders.lock().unwrap().awaiting_submission.is_empty());
+    assert_eq!(*client.next_order_id.lock(), 100);
+}
+
+#[rstest]
+#[case::generic(anyhow::anyhow!("contract not found"), "ORDER_INVALID: contract not found")]
+#[case::canonical(anyhow::Error::new(OrderDeniedReason::unsupported_quote_quantity()).context("Failed to transform order"), "UNSUPPORTED_QUOTE_QUANTITY")]
+#[case::canonical_detail(anyhow::Error::new(OrderDeniedReason::unsupported_quote_quantity_with_detail("IB error 10244; use base quantity")).context("Failed to transform order"), "UNSUPPORTED_QUOTE_QUANTITY: IB error 10244; use base quantity")]
+fn unpreparable_order_is_denied_with_coded_reason(
+    #[case] error: anyhow::Error,
+    #[case] expected_reason: &str,
+) {
     let client_order_id = ClientOrderId::from("O-UNPREPARABLE-001");
     let order = create_test_limit_order(client_order_id);
     let trader_id = TraderId::from("TRADER-001");
@@ -2185,7 +2270,6 @@ fn unpreparable_order_is_denied_with_coded_reason() {
         UnixNanos::default(),
     );
     let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
-    let error = anyhow::anyhow!("contract not found");
     let orders = OrderTracker::new(NATIVE_CLIENT_ID);
     InteractiveBrokersExecutionClient::register_awaiting_submission(
         client_order_id,
@@ -2202,10 +2286,7 @@ fn unpreparable_order_is_denied_with_coded_reason() {
         nautilus_core::time::get_atomic_clock_realtime(),
     );
 
-    assert_eq!(
-        result.unwrap_err().to_string(),
-        "ORDER_INVALID: contract not found"
-    );
+    assert_eq!(result.unwrap_err().to_string(), expected_reason);
 
     match exec_receiver.try_recv().unwrap() {
         ExecutionEvent::Order(OrderEventAny::Denied(event)) => {
@@ -2213,7 +2294,7 @@ fn unpreparable_order_is_denied_with_coded_reason() {
             assert_eq!(event.strategy_id, cmd.strategy_id);
             assert_eq!(event.instrument_id, cmd.instrument_id);
             assert_eq!(event.client_order_id, client_order_id);
-            assert_eq!(event.reason.as_str(), "ORDER_INVALID: contract not found");
+            assert_eq!(event.reason.as_str(), expected_reason);
         }
         event => panic!("Expected denied order event, was {event:?}"),
     }
@@ -2222,7 +2303,19 @@ fn unpreparable_order_is_denied_with_coded_reason() {
 }
 
 #[rstest]
-fn prepare_order_list_fails_before_submission_on_an_untransformable_child() {
+#[case::trailing(
+    false,
+    "ORDER_LIST_INVALID: Failed to transform order: `TrailingOffsetType` Ticks is not supported"
+)]
+#[case::quote_quantity(
+    true,
+    "UNSUPPORTED_QUOTE_QUANTITY: Interactive Brokers only accepts a quote quantity (`cash_qty`) for inverse instruments; AAPL.XNAS must use the base quantity"
+)]
+#[tokio::test]
+async fn prepare_order_list_fails_before_submission_on_an_untransformable_child(
+    #[case] quote_quantity: bool,
+    #[case] expected_reason: &str,
+) {
     let equity = equity_aapl();
     let instrument_id = equity.id();
     let instrument_provider = create_test_instrument_provider();
@@ -2234,16 +2327,23 @@ fn prepare_order_list_fails_before_submission_on_an_untransformable_child() {
         .price(Price::from("100.00"))
         .quantity(Quantity::from(1))
         .build();
-    let stop = OrderTestBuilder::new(OrderType::TrailingStopMarket)
-        .instrument_id(instrument_id)
-        .client_order_id(ClientOrderId::from("O-LIST-STOP"))
-        .parent_order_id(entry.client_order_id())
-        .side(OrderSide::Sell)
-        .quantity(Quantity::from(1))
-        .trigger_price(Price::from("95.00"))
-        .trailing_offset(Decimal::from(5))
-        .trailing_offset_type(TrailingOffsetType::Ticks)
-        .build();
+
+    let stop = OrderTestBuilder::new(if quote_quantity {
+        OrderType::StopMarket
+    } else {
+        OrderType::TrailingStopMarket
+    })
+    .instrument_id(instrument_id)
+    .client_order_id(ClientOrderId::from("O-LIST-STOP"))
+    .parent_order_id(entry.client_order_id())
+    .quote_quantity(quote_quantity)
+    .side(OrderSide::Sell)
+    .quantity(Quantity::from(1))
+    .trigger_price(Price::from("95.00"))
+    .trailing_offset(Decimal::from(5))
+    .trailing_offset_type(TrailingOffsetType::Ticks)
+    .build();
+
     let orders = vec![entry.clone(), stop.clone()];
 
     let cmd = SubmitOrderList::new(
@@ -2268,25 +2368,53 @@ fn prepare_order_list_fails_before_submission_on_an_untransformable_child() {
         UnixNanos::default(),
         None,
     );
-    let ib_order_ids = AHashMap::from([
-        (entry.client_order_id(), 7401),
-        (stop.client_order_id(), 7402),
-    ]);
+    let tracker = OrderTracker::new(NATIVE_CLIENT_ID);
 
-    let error = InteractiveBrokersExecutionClient::prepare_order_list(
+    for order in &orders {
+        InteractiveBrokersExecutionClient::register_awaiting_submission(
+            order.client_order_id(),
+            awaiting_submission(order),
+            &tracker,
+        )
+        .unwrap();
+    }
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let submit_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let result = InteractiveBrokersExecutionClient::prepare_submit_order_list(
         &cmd,
         &orders,
-        &ib_order_ids,
-        &OrderTracker::new(NATIVE_CLIENT_ID),
+        async { Ok(()) },
+        &tracker,
+        &Arc::new(Mutex::new(7401)),
         &instrument_provider,
+        &sender.clone().into(),
+        get_atomic_clock_realtime(),
         Ustr::from("DU001"),
+        entry.strategy_id(),
+        &submit_lock,
     )
-    .expect_err("an untransformable child fails preparation");
+    .await;
+
+    assert!(result.is_err());
+
+    for order in &orders {
+        let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = receiver.try_recv().unwrap()
+        else {
+            panic!("Expected order denial");
+        };
+
+        assert_eq!(denied.client_order_id, order.client_order_id());
+        assert_eq!(denied.instrument_id, order.instrument_id());
+        assert_eq!(denied.strategy_id, order.strategy_id());
+        assert_eq!(denied.reason.as_str(), expected_reason);
+    }
 
     assert_eq!(
-        format!("{error:#}"),
-        "Failed to transform order: `TrailingOffsetType` Ticks is not supported"
+        receiver.try_recv().unwrap_err(),
+        tokio::sync::mpsc::error::TryRecvError::Empty
     );
+    assert!(tracker.lock().unwrap().awaiting_submission.is_empty());
 }
 
 #[rstest]
@@ -6018,12 +6146,17 @@ fn create_magnified_zc_future() -> InstrumentAny {
         currency: IBCurrency::from("USD"),
         ..Default::default()
     };
-    let mut info = Params::new();
-    info.insert(
-        "contract".to_string(),
-        crate::common::contract_to_json_value(&contract),
+
+    let info = Params::new(
+        [
+            (
+                "contract".to_string(),
+                crate::common::contract_to_json_value(&contract),
+            ),
+            ("priceMagnifier".to_string(), serde_json::Value::from(100)),
+        ]
+        .into(),
     );
-    info.insert("priceMagnifier".to_string(), serde_json::Value::from(100));
     let instrument = FuturesContract::builder()
         .instrument_id(InstrumentId::from("ZCZ6.CBOT"))
         .raw_symbol(Symbol::from("ZCZ6"))
@@ -6367,4 +6500,431 @@ async fn cancel_while_price_magnifier_loads_stops_the_order_list(
     assert!(state.order_id_map.is_empty());
     assert!(state.active_orders.is_empty());
     assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
+fn seed_instruments_from_cache_adds_instruments_loaded_by_data_client() {
+    let (client, _rx, cache) = create_test_execution_client();
+    let instrument_id = InstrumentId::from("AAPL.NASDAQ");
+    let absent_id = InstrumentId::from("MSFT.NASDAQ");
+
+    let contract = Contract {
+        contract_id: 265598,
+        symbol: IBSymbol::from("AAPL"),
+        security_type: SecurityType::Stock,
+        exchange: Exchange::from("SMART"),
+        currency: IBCurrency::from("USD"),
+        ..Default::default()
+    };
+
+    let info = Params::new(
+        [
+            (
+                String::from("contract"),
+                crate::common::contracts::contract_to_json_value(&contract),
+            ),
+            (String::from("priceMagnifier"), serde_json::Value::from(1)),
+        ]
+        .into(),
+    );
+    let instrument: InstrumentAny = CurrencyPair::builder()
+        .instrument_id(instrument_id)
+        .raw_symbol(Symbol::from("AAPL"))
+        .base_currency(Currency::from("EUR"))
+        .quote_currency(Currency::from("USD"))
+        .price_precision(2)
+        .size_precision(0)
+        .price_increment(Price::from("0.01"))
+        .size_increment(Quantity::from(1))
+        .maybe_info(Some(info))
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap()
+        .into();
+    cache.borrow_mut().add_instrument(instrument).unwrap();
+    assert!(client.instrument_provider.find(&instrument_id).is_none());
+
+    client.seed_instruments_from_cache([instrument_id, absent_id]);
+
+    assert!(client.instrument_provider.find(&instrument_id).is_some());
+    assert_eq!(
+        client
+            .instrument_provider
+            .resolve_contract_for_instrument(instrument_id)
+            .unwrap(),
+        contract
+    );
+    assert!(client.instrument_provider.find(&absent_id).is_none());
+}
+
+/// Order-update stream stand-in that counts live instances, so a test can check that the
+/// previous stream was dropped before the next bind.
+struct LiveCountedSubscription {
+    inner: ChannelSubscription<OrderUpdate>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl LiveCountedSubscription {
+    fn new(
+        inner: ChannelSubscription<OrderUpdate>,
+        live: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        Self {
+            inner,
+            live: Arc::clone(live),
+        }
+    }
+}
+
+impl Drop for LiveCountedSubscription {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl futures_util::Stream for LiveCountedSubscription {
+    type Item = Result<ibapi::subscriptions::SubscriptionItem<OrderUpdate>, ibapi::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+type OrderUpdateChannel = (
+    tokio::sync::mpsc::UnboundedSender<Result<OrderUpdate, ibapi::Error>>,
+    ChannelSubscription<OrderUpdate>,
+);
+
+fn order_update_channel() -> OrderUpdateChannel {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    (sender, ChannelSubscription::new(receiver))
+}
+
+/// A bind factory handing out the queued streams in order; `None` is a failed bind. Sends
+/// on the returned channel per call, counts the calls, and counts binds made while a
+/// previous stream was still alive.
+fn bind_queue(
+    streams: Vec<Option<ChannelSubscription<OrderUpdate>>>,
+    live: &Arc<std::sync::atomic::AtomicUsize>,
+) -> (
+    impl FnMut() -> std::future::Ready<anyhow::Result<LiveCountedSubscription>>,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (bound_tx, bound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let binds_while_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let violations = Arc::clone(&binds_while_live);
+    let live = Arc::clone(live);
+    let mut queue: std::collections::VecDeque<_> = streams.into();
+    let bind = move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        if live.load(Ordering::SeqCst) != 0 {
+            violations.fetch_add(1, Ordering::SeqCst);
+        }
+        let _ = bound_tx.send(());
+        std::future::ready(match queue.pop_front() {
+            Some(Some(stream)) => Ok(LiveCountedSubscription::new(stream, &live)),
+            _ => Err(anyhow::anyhow!("no order update stream")),
+        })
+    };
+    (bind, bound_rx, calls, binds_while_live)
+}
+
+async fn run_order_update_stream_for_test<B, F>(
+    orders: &OrderTracker,
+    exec_sender: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+    initial: LiveCountedSubscription,
+    bind: B,
+    is_client_alive: impl Fn() -> bool,
+    cancel: CancellationToken,
+) -> OrderUpdateLoopOutcome
+where
+    B: FnMut() -> F,
+    F: std::future::Future<Output = anyhow::Result<LiveCountedSubscription>>,
+{
+    let instrument_provider = create_test_instrument_provider();
+    let commission_cache = Arc::new(Mutex::new(CommissionCache::new()));
+    let pending_execution_cache = Arc::new(Mutex::new(PendingExecutionCache::new()));
+    let position_tracker = create_position_tracker();
+
+    InteractiveBrokersExecutionClient::run_order_update_stream(
+        initial,
+        bind,
+        is_client_alive,
+        cancel,
+        RebindDelays {
+            after_stream: Duration::from_millis(10),
+            after_bind_failure: Duration::from_millis(10),
+        },
+        orders,
+        &instrument_provider,
+        &exec_sender.into(),
+        nautilus_core::time::get_atomic_clock_realtime(),
+        AccountId::from("IB-001"),
+        Ustr::from("001"),
+        &commission_cache,
+        &pending_execution_cache,
+        &position_tracker,
+        None,
+    )
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_run_order_update_stream_rebinds_after_error_and_end() {
+    let orders = OrderTracker::new(NATIVE_CLIENT_ID);
+    let instrument_id = create_test_spread_instrument();
+
+    for order_id in [7101, 7102] {
+        let client_order_id = ClientOrderId::from(format!("O-REBIND-{order_id}").as_str());
+        insert_tracked_order(
+            &orders,
+            order_id,
+            create_tracked_order_context(client_order_id, instrument_id),
+        );
+    }
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Stream A: two items, then a terminal error.
+    let (sender_a, stream_a) = order_update_channel();
+    sender_a
+        .send(Ok(OrderUpdate::OpenOrder(create_test_open_order(
+            7101,
+            "Submitted",
+            "",
+        ))))
+        .unwrap();
+    sender_a
+        .send(Ok(OrderUpdate::OrderStatus(create_test_order_status(
+            7101,
+            "Cancelled",
+        ))))
+        .unwrap();
+    sender_a
+        .send(Err(ibapi::Error::Parse(
+            0,
+            String::new(),
+            "empty Action".to_string(),
+        )))
+        .unwrap();
+    // Stream B: an open order and its status, then it ends (sender dropped).
+    let (sender_b, stream_b) = order_update_channel();
+    sender_b
+        .send(Ok(OrderUpdate::OpenOrder(create_test_open_order(
+            7102,
+            "Submitted",
+            "",
+        ))))
+        .unwrap();
+    sender_b
+        .send(Ok(OrderUpdate::OrderStatus(create_test_order_status(
+            7102,
+            "Submitted",
+        ))))
+        .unwrap();
+    drop(sender_b);
+    // Stream C: stays open until the loop is stopped.
+    let (_sender_c, stream_c) = order_update_channel();
+
+    // Bind 1 fails (retry path), bind 2 hands out B, bind 3 hands out C.
+    let (bind, mut binds, calls, binds_while_live) =
+        bind_queue(vec![None, Some(stream_b), Some(stream_c)], &live);
+    let initial = LiveCountedSubscription::new(stream_a, &live);
+    let cancel = CancellationToken::new();
+
+    let controller = async {
+        for expected in ["Accepted", "Canceled", "Accepted"] {
+            let event = exec_receiver.recv().await.expect("event");
+            let ExecutionEvent::Order(event) = event else {
+                panic!("unexpected event: {event:?}");
+            };
+            let name = match event {
+                OrderEventAny::Accepted(_) => "Accepted",
+                OrderEventAny::Canceled(_) => "Canceled",
+                other => panic!("unexpected order event: {other:?}"),
+            };
+            assert_eq!(name, expected);
+        }
+
+        for _ in 0..3 {
+            binds.recv().await.expect("bind call");
+        }
+        cancel.cancel();
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            run_order_update_stream_for_test(
+                &orders,
+                exec_sender,
+                initial,
+                bind,
+                || true,
+                cancel.clone()
+            ),
+            controller
+        );
+    })
+    .await
+    .expect("loop re-binds and returns once cancelled");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        binds_while_live.load(Ordering::SeqCst),
+        0,
+        "the ended stream must be dropped before the next bind"
+    );
+    assert!(exec_receiver.try_recv().is_err(), "no further events");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_run_order_update_stream_stops_on_cancel() {
+    let orders = OrderTracker::new(NATIVE_CLIENT_ID);
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (_sender, stream) = order_update_channel();
+    let (bind, _, calls, _) = bind_queue(Vec::new(), &live);
+    let initial = LiveCountedSubscription::new(stream, &live);
+    let cancel = CancellationToken::new();
+
+    let controller = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            run_order_update_stream_for_test(
+                &orders,
+                exec_sender,
+                initial,
+                bind,
+                || true,
+                cancel.clone()
+            ),
+            controller
+        );
+    })
+    .await
+    .expect("loop returns once cancelled");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no re-bind after stop");
+    assert!(exec_receiver.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_run_order_update_stream_stops_when_stream_ends_on_dead_client() {
+    let orders = OrderTracker::new(NATIVE_CLIENT_ID);
+    let (exec_sender, _exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The stream ends without an error (sender dropped) while the client reports down.
+    let (sender, stream) = order_update_channel();
+    drop(sender);
+    let (_spare_sender, spare) = order_update_channel();
+    let (bind, _, calls, _) = bind_queue(vec![Some(spare)], &live);
+    let initial = LiveCountedSubscription::new(stream, &live);
+
+    let exit = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_order_update_stream_for_test(
+            &orders,
+            exec_sender,
+            initial,
+            bind,
+            || false,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("loop returns on a dead client");
+
+    assert_eq!(exit, OrderUpdateLoopOutcome::TransportShutdown);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no bind on a dead client");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_run_order_update_stream_stops_on_shutdown_error() {
+    let orders = OrderTracker::new(NATIVE_CLIENT_ID);
+    let (exec_sender, _exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // ibapi 5.0 ends every subscription with `Error::Shutdown` on a bus shutdown
+    let (sender, stream) = order_update_channel();
+    sender.send(Err(ibapi::Error::Shutdown)).unwrap();
+    drop(sender);
+    let (_spare_sender, spare) = order_update_channel();
+    let (bind, _, calls, _) = bind_queue(vec![Some(spare)], &live);
+    let initial = LiveCountedSubscription::new(stream, &live);
+
+    let exit = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_order_update_stream_for_test(
+            &orders,
+            exec_sender,
+            initial,
+            bind,
+            || true,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("loop returns on a shutdown error");
+
+    assert_eq!(exit, OrderUpdateLoopOutcome::TransportShutdown);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no bind after a shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_run_order_update_stream_stops_when_bind_fails_with_shutdown() {
+    let orders = OrderTracker::new(NATIVE_CLIENT_ID);
+    let (exec_sender, _exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The stream errors, so the loop re-binds; the bus then shuts down and every bind fails
+    // with `Error::Shutdown`, wrapped in the same `anyhow` context as the production bind.
+    let (sender, stream) = order_update_channel();
+    sender
+        .send(Err(ibapi::Error::Parse(
+            0,
+            String::new(),
+            "empty Action".to_string(),
+        )))
+        .unwrap();
+    drop(sender);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let bind = move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        std::future::ready(Err::<LiveCountedSubscription, _>(
+            anyhow::Error::from(ibapi::Error::Shutdown)
+                .context("Failed to start order update stream"),
+        ))
+    };
+    let initial = LiveCountedSubscription::new(stream, &live);
+
+    let exit = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_order_update_stream_for_test(
+            &orders,
+            exec_sender,
+            initial,
+            bind,
+            || true,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("loop returns when the bind fails with a shutdown");
+
+    assert_eq!(exit, OrderUpdateLoopOutcome::TransportShutdown);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "no retry after a bind failed with a shutdown"
+    );
 }

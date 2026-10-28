@@ -255,7 +255,8 @@ mod tests {
         let instrument_id = instrument.id;
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
         provider.insert_test_instrument(InstrumentAny::CryptoPerpetual(instrument), 4242, 1);
 
         let mut builder = OrderTestBuilder::new(order_type);
@@ -300,28 +301,28 @@ mod tests {
         OrderType::Limit,
         NautilusTimeInForce::Gtc,
         None,
-        "(IB error 10244 for LIMIT sent as LMT)"
+        "UNSUPPORTED_QUOTE_QUANTITY: Interactive Brokers only accepts a quote quantity (`cash_qty`) for MARKET orders (IB error 10244 for LIMIT sent as LMT); use the base quantity"
     )]
     #[case::market_at_the_close(
         OrderSide::Buy,
         OrderType::Market,
         NautilusTimeInForce::AtTheClose,
         None,
-        "(IB error 10244 for MARKET sent as MOC)"
+        "UNSUPPORTED_QUOTE_QUANTITY: Interactive Brokers only accepts a quote quantity (`cash_qty`) for MARKET orders (IB error 10244 for MARKET sent as MOC); use the base quantity"
     )]
     #[case::market_tagged_limit(
         OrderSide::Buy,
         OrderType::Market,
         NautilusTimeInForce::Gtc,
         Some(r#"{"orderType":"LMT"}"#),
-        "(IB error 10244 for MARKET sent as LMT)"
+        "UNSUPPORTED_QUOTE_QUANTITY: Interactive Brokers only accepts a quote quantity (`cash_qty`) for MARKET orders (IB error 10244 for MARKET sent as LMT); use the base quantity"
     )]
     #[case::sell(
         OrderSide::Sell,
         OrderType::Market,
         NautilusTimeInForce::Gtc,
         None,
-        "only accepts a quote quantity (`cash_qty`) for BUY orders"
+        "UNSUPPORTED_QUOTE_QUANTITY: Interactive Brokers only accepts a quote quantity (`cash_qty`) for BUY orders; a SELL must use the base quantity"
     )]
     #[case::sell_tagged_buy(
         OrderSide::Sell,
@@ -342,7 +343,7 @@ mod tests {
         OrderType::Market,
         NautilusTimeInForce::Gtc,
         Some(r#"{"cashQty":5.0}"#),
-        "IBOrderTags cannot set cash_qty"
+        "IBOrderTags cannot set cash_qty, which the adapter sets from the order"
     )]
     fn test_quote_quantity_order_is_denied_before_submission(
         #[case] side: OrderSide,
@@ -358,7 +359,7 @@ mod tests {
             .expect_err("the quote quantity order must be denied");
 
         let message = format!("{err:#}");
-        assert!(message.contains(expected), "unexpected reason: {message}");
+        assert_eq!(message, expected);
     }
 
     #[rstest]
@@ -366,7 +367,8 @@ mod tests {
         let instrument_id = InstrumentId::new(NautilusSymbol::from("AAPL"), Venue::from("NASDAQ"));
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
         let order = OrderTestBuilder::new(OrderType::Market)
             .instrument_id(instrument_id)
             .side(OrderSide::Buy)
@@ -379,8 +381,7 @@ mod tests {
 
         assert_eq!(
             format!("{err:#}"),
-            "Interactive Brokers only accepts a quote quantity (`cash_qty`) for inverse \
-             instruments; AAPL.NASDAQ must use the base quantity"
+            "UNSUPPORTED_QUOTE_QUANTITY: Interactive Brokers only accepts a quote quantity (`cash_qty`) for inverse instruments; AAPL.NASDAQ must use the base quantity"
         );
     }
 
@@ -396,7 +397,8 @@ mod tests {
         let order = create_test_order_with_side_and_tags(side, tags_json);
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("an action within the order side is valid");
@@ -454,7 +456,8 @@ mod tests {
         let order = create_test_order_with_side_and_tags(side, tags_json);
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let err = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect_err("the tag must be rejected");
@@ -493,7 +496,7 @@ mod tests {
         let tags_json = r#"{"activeStartTime": "20250101 09:30:00 UTC"}"#;
         let order = create_test_order_with_tags(tags_json);
         let config = InteractiveBrokersInstrumentProviderConfig::default();
-        let provider = InteractiveBrokersInstrumentProvider::new(config);
+        let provider = InteractiveBrokersInstrumentProvider::new(config).unwrap();
 
         let result = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001");
         assert!(result.is_ok());
@@ -507,7 +510,7 @@ mod tests {
         let tags_json = r#"{"activeStopTime": "20250101 16:00:00 UTC"}"#;
         let order = create_test_order_with_tags(tags_json);
         let config = InteractiveBrokersInstrumentProviderConfig::default();
-        let provider = InteractiveBrokersInstrumentProvider::new(config);
+        let provider = InteractiveBrokersInstrumentProvider::new(config).unwrap();
 
         let result = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001");
         assert!(result.is_ok());
@@ -521,7 +524,7 @@ mod tests {
         let tags_json = r#"{"activeStartTime": "20250101 09:30:00 UTC", "activeStopTime": "20250101 16:00:00 UTC"}"#;
         let order = create_test_order_with_tags(tags_json);
         let config = InteractiveBrokersInstrumentProviderConfig::default();
-        let provider = InteractiveBrokersInstrumentProvider::new(config);
+        let provider = InteractiveBrokersInstrumentProvider::new(config).unwrap();
 
         let result = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001");
         assert!(result.is_ok());
@@ -545,7 +548,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -560,7 +564,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -578,7 +583,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -593,7 +599,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -617,7 +624,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -637,7 +645,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -696,7 +705,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -775,7 +785,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let result = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001");
 
@@ -795,7 +806,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let result = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001");
 
@@ -829,7 +841,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -854,7 +867,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -880,7 +894,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -906,7 +921,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let err = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect_err("unsupported trailing offset type should fail");
@@ -945,7 +961,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -991,7 +1008,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -1017,7 +1035,8 @@ mod tests {
 
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
 
         let ib_order = nautilus_order_to_ib_order(&order, &provider, 1, "TEST-001")
             .expect("order transform should succeed");
@@ -1029,7 +1048,8 @@ mod tests {
     fn magnified_provider(price_magnifier: i32) -> InteractiveBrokersInstrumentProvider {
         let provider = InteractiveBrokersInstrumentProvider::new(
             InteractiveBrokersInstrumentProviderConfig::default(),
-        );
+        )
+        .unwrap();
         provider.insert_test_instrument(
             InstrumentAny::Equity(equity_aapl()),
             4242,

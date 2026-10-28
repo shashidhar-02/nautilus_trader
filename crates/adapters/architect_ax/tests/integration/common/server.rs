@@ -56,6 +56,7 @@ use ustr::Ustr;
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CapturedOrdersQuery {
+    pub order_id: Option<String>,
     pub start_timestamp_ns: Option<i64>,
     pub end_timestamp_ns: Option<i64>,
     pub limit: Option<i32>,
@@ -86,6 +87,8 @@ pub(crate) struct TestServerState {
     pub whoami_fail: Arc<AtomicBool>,
     pub whoami_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
     pub order_fill_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+    pub order_injected_events: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    pub order_initial_events: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
     pub instrument_queries: Arc<tokio::sync::Mutex<Vec<GetInstrumentParams>>>,
     pub instrument_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
     pub instrument_fail: Arc<AtomicBool>,
@@ -97,9 +100,15 @@ pub(crate) struct TestServerState {
     pub preview_empty: Arc<AtomicBool>,
     pub preview_fail: Arc<AtomicBool>,
     pub preview_partial: Arc<AtomicBool>,
+    pub replace_order_response_delay: Arc<AtomicBool>,
+    pub replace_order_response_release: Arc<tokio::sync::Notify>,
+    pub replace_order_response_sent: Arc<tokio::sync::Notify>,
     pub replace_order_fail: Arc<AtomicBool>,
     pub replace_order_count: Arc<AtomicUsize>,
+    pub replace_order_requests: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
     pub replace_order_oid: Arc<tokio::sync::Mutex<Option<String>>>,
+    pub order_status_responses: Arc<tokio::sync::Mutex<Vec<(String, u16, serde_json::Value)>>>,
+    pub order_status_response: Arc<tokio::sync::Mutex<Option<(u16, serde_json::Value)>>>,
     pub order_status_queries: Arc<tokio::sync::Mutex<Vec<GetOrderStatusParams>>>,
     pub open_orders_queries: Arc<tokio::sync::Mutex<Vec<GetOpenOrdersParams>>>,
     pub open_orders_payload: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
@@ -137,6 +146,8 @@ impl Default for TestServerState {
             whoami_fail: Arc::new(AtomicBool::new(false)),
             whoami_payload: Arc::new(tokio::sync::Mutex::new(None)),
             order_fill_payload: Arc::new(tokio::sync::Mutex::new(None)),
+            order_injected_events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            order_initial_events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             instrument_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             instrument_payload: Arc::new(tokio::sync::Mutex::new(None)),
             instrument_fail: Arc::new(AtomicBool::new(false)),
@@ -148,9 +159,15 @@ impl Default for TestServerState {
             preview_empty: Arc::new(AtomicBool::new(false)),
             preview_fail: Arc::new(AtomicBool::new(false)),
             preview_partial: Arc::new(AtomicBool::new(false)),
+            replace_order_response_delay: Arc::new(AtomicBool::new(false)),
+            replace_order_response_release: Arc::new(tokio::sync::Notify::new()),
+            replace_order_response_sent: Arc::new(tokio::sync::Notify::new()),
             replace_order_fail: Arc::new(AtomicBool::new(false)),
             replace_order_count: Arc::new(AtomicUsize::new(0)),
+            replace_order_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             replace_order_oid: Arc::new(tokio::sync::Mutex::new(None)),
+            order_status_responses: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            order_status_response: Arc::new(tokio::sync::Mutex::new(None)),
             order_status_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             open_orders_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             open_orders_payload: Arc::new(tokio::sync::Mutex::new(None)),
@@ -519,7 +536,29 @@ async fn handle_orders_socket(mut socket: WebSocket, state: TestServerState) {
 
     state.authenticated.store(true, Ordering::Relaxed);
 
+    let initial_events = state.order_initial_events.lock().await.clone();
+    for event in initial_events {
+        if socket
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
     loop {
+        let frames = std::mem::take(&mut *state.order_injected_events.lock().await);
+        for frame in frames {
+            if socket
+                .send(Message::Text(frame.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
         if state.disconnect_trigger.load(Ordering::Relaxed) {
             break;
         }
@@ -791,7 +830,17 @@ async fn handle_replace_order(
     State(state): State<TestServerState>,
     axum::Json(payload): axum::Json<serde_json::Value>,
 ) -> axum::response::Response {
+    state
+        .replace_order_requests
+        .lock()
+        .await
+        .push(payload.clone());
     state.replace_order_count.fetch_add(1, Ordering::Relaxed);
+    if state.replace_order_response_delay.load(Ordering::Relaxed) {
+        state.replace_order_response_release.notified().await;
+    }
+
+    state.replace_order_response_sent.notify_one();
     if state.replace_order_fail.load(Ordering::Relaxed) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -815,9 +864,43 @@ async fn handle_replace_order(
 async fn handle_order_status(
     State(state): State<TestServerState>,
     Query(params): Query<GetOrderStatusParams>,
-) -> Json<serde_json::Value> {
+) -> Response {
+    let response = {
+        let mut responses = state.order_status_responses.lock().await;
+        let index = responses
+            .iter()
+            .position(|(id, _, _)| params.order_id.as_ref() == Some(id));
+        index.map(|index| {
+            let (_, status, body) = responses[index].clone();
+            if responses
+                .iter()
+                .skip(index + 1)
+                .any(|(id, _, _)| params.order_id.as_ref() == Some(id))
+            {
+                responses.remove(index);
+            }
+
+            (status, body)
+        })
+    };
+
     state.order_status_queries.lock().await.push(params);
-    Json(load_test_data("http_get_order_status.json"))
+
+    let (status, body) = match response {
+        Some(response) => response,
+        None => state
+            .order_status_response
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| (200, load_test_data("http_get_order_status.json"))),
+    };
+
+    (
+        axum::http::StatusCode::from_u16(status).unwrap(),
+        Json(body),
+    )
+        .into_response()
 }
 
 async fn handle_open_orders(
@@ -825,7 +908,10 @@ async fn handle_open_orders(
     Query(params): Query<GetOpenOrdersParams>,
 ) -> Json<serde_json::Value> {
     state.open_orders_queries.lock().await.push(params.clone());
-    if state.order_report_response_delay.load(Ordering::Relaxed) {
+    if state
+        .order_report_response_delay
+        .swap(false, Ordering::Relaxed)
+    {
         state.order_report_response_entered.notify_one();
         state.order_report_response_release.notified().await;
     }
@@ -862,7 +948,10 @@ async fn handle_orders(
     Query(params): Query<CapturedOrdersQuery>,
 ) -> Json<serde_json::Value> {
     state.orders_queries.lock().await.push(params.clone());
-    if state.order_report_response_delay.load(Ordering::Relaxed) {
+    if state
+        .order_report_response_delay
+        .swap(false, Ordering::Relaxed)
+    {
         state.order_report_response_entered.notify_one();
         state.order_report_response_release.notified().await;
     }
@@ -877,6 +966,23 @@ async fn handle_orders(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+
+    let orders = orders
+        .into_iter()
+        .filter(|order| {
+            let timestamp =
+                order["ts"].as_i64().unwrap() * 1_000_000_000 + order["tn"].as_i64().unwrap();
+            params
+                .order_id
+                .as_ref()
+                .is_none_or(|id| order["oid"].as_str() == Some(id.as_str()))
+                && params
+                    .start_timestamp_ns
+                    .is_none_or(|start| timestamp >= start)
+                && params.end_timestamp_ns.is_none_or(|end| timestamp <= end)
+        })
+        .collect::<Vec<_>>();
+
     let total_count = orders.len();
     let repeated_cursor = state.orders_repeated_cursor.lock().await.clone();
     let offset = match params.cursor.as_deref() {

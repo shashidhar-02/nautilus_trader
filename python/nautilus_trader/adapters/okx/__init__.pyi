@@ -139,6 +139,8 @@ class OKXExecutionClientConfig:
     def transport_backend(self) -> network.TransportBackend: ...
     @property
     def spot_trade_quote_ccy(self) -> str | None: ...
+    @property
+    def max_reconciliation_history_pages(self) -> int | None: ...
     def __init__(
         self,
         account_id: model.AccountId,
@@ -162,6 +164,7 @@ class OKXExecutionClientConfig:
         transport_backend: network.TransportBackend | None = None,
         spot_trade_quote_ccy: str | None = None,
         oms_type: model.OmsType | None = None,
+        max_reconciliation_history_pages: int | None = None,
     ) -> None: ...
     @property
     def has_proxy_url(self) -> bool: ...
@@ -346,6 +349,7 @@ class OKXHttpClient:
         callback_ratio: str | None = None,
         callback_spread: str | None = None,
         activation_price: model.Price | None = None,
+        quote_quantity: bool = False,
     ) -> typing.Any: ...
     def cancel_algo_order(self, instrument_id: model.InstrumentId, algo_id: str) -> typing.Any: ...
     def cancel_order(

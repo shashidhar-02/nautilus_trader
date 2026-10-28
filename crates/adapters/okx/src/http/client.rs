@@ -121,8 +121,8 @@ use crate::{
         consts::{
             OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_HTTP_URL, OKX_NAUTILUS_BROKER_ID,
             OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUPPORTED_ORDER_TYPES,
-            OKX_SUPPORTED_TIME_IN_FORCE, okx_reduce_only_wire_value,
-            spot_trade_quote_ccy_wire_value,
+            OKX_SUPPORTED_TIME_IN_FORCE, okx_algo_target_currency, okx_reduce_only_wire_value,
+            spot_trade_quote_ccy_wire_value, validate_algo_trigger_type,
         },
         credential::Credential,
         enums::{
@@ -659,7 +659,7 @@ struct PageSweep<T> {
 impl<T> PageSweep<T> {
     fn from_pages(items: Vec<T>, exhausted: bool) -> Self {
         Self {
-            complete: !exhausted || items.is_empty(),
+            complete: !exhausted,
             items,
         }
     }
@@ -4349,6 +4349,7 @@ impl OKXHttpClient {
                 open_only,
                 limit,
                 None,
+                None,
             )
             .await?
             .reports)
@@ -4365,6 +4366,7 @@ impl OKXHttpClient {
         open_only: bool,
         limit: Option<u32>,
         scope: Option<ReportInstrumentScope<'_>>,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<ReportSweep<OrderStatusReport>> {
         if instrument_id.as_ref().is_some_and(|id| self.is_spread(*id))
             || (instrument_id.is_none() && instrument_type.is_none())
@@ -4378,6 +4380,7 @@ impl OKXHttpClient {
                     open_only,
                     limit,
                     scope,
+                    max_history_pages,
                 )
                 .await;
         }
@@ -4414,7 +4417,11 @@ impl OKXHttpClient {
         } else {
             let (history, pending) = Box::pin(async {
                 tokio::try_join!(
-                    self.paginate_orders_history(&history_base, limit),
+                    self.paginate_orders_history(
+                        &history_base,
+                        limit,
+                        reconciliation_history_page_limit(max_history_pages),
+                    ),
                     self.paginate_orders_pending(&pending_base, limit),
                 )
             })
@@ -4657,6 +4664,7 @@ impl OKXHttpClient {
                 open_only,
                 limit,
                 None,
+                None,
             )
             .await?
             .reports)
@@ -4672,6 +4680,7 @@ impl OKXHttpClient {
         open_only: bool,
         limit: Option<u32>,
         scope: Option<ReportInstrumentScope<'_>>,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<ReportSweep<OrderStatusReport>> {
         let mut pending_builder = GetSpreadOrdersParamsBuilder::default();
         let mut history_builder = GetSpreadOrdersParamsBuilder::default();
@@ -4706,7 +4715,11 @@ impl OKXHttpClient {
         } else {
             let (history, pending) = Box::pin(async {
                 tokio::try_join!(
-                    self.paginate_spread_orders_history(&history_base, limit),
+                    self.paginate_spread_orders_history(
+                        &history_base,
+                        limit,
+                        reconciliation_history_page_limit(max_history_pages),
+                    ),
                     self.paginate_spread_orders_pending(&pending_base, limit),
                 )
             })
@@ -4797,12 +4810,13 @@ impl OKXHttpClient {
         &self,
         base: &GetSpreadOrdersParams,
         limit: Option<u32>,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXSpreadOrder>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.end_id = cursor.take();
 
@@ -4831,7 +4845,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Spread order history pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Spread order history pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -4900,12 +4914,13 @@ impl OKXHttpClient {
         &self,
         base: &GetOrderHistoryParams,
         limit: Option<u32>,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXOrderHistory>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.after = cursor.take();
 
@@ -4934,7 +4949,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Order history pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Order history pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -5005,12 +5020,13 @@ impl OKXHttpClient {
         base: &GetTransactionDetailsParams,
         limit: Option<u32>,
         history: FillHistory,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXTransactionDetail>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.after = cursor.take();
 
@@ -5039,7 +5055,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Fill pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Fill pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -5112,12 +5128,13 @@ impl OKXHttpClient {
         base: &GetAlgoOrdersParams,
         limit: Option<usize>,
         require_complete_active_coverage: bool,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXOrderAlgo>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.after = cursor.take();
 
@@ -5151,7 +5168,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Algo history pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Algo history pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -5188,6 +5205,7 @@ impl OKXHttpClient {
                 limit,
                 FillHistory::Recent,
                 None,
+                None,
             )
             .await?
             .reports)
@@ -5204,6 +5222,7 @@ impl OKXHttpClient {
         limit: Option<u32>,
         history: FillHistory,
         scope: Option<ReportInstrumentScope<'_>>,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<ReportSweep<FillReport>> {
         if instrument_id.as_ref().is_some_and(|id| self.is_spread(*id))
             || (instrument_id.is_none() && instrument_type.is_none())
@@ -5216,6 +5235,7 @@ impl OKXHttpClient {
                     end,
                     limit,
                     scope,
+                    max_history_pages,
                 )
                 .await;
         }
@@ -5251,7 +5271,14 @@ impl OKXHttpClient {
 
         let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
 
-        let sweep = self.paginate_fills(&params, limit, history).await?;
+        let sweep = self
+            .paginate_fills(
+                &params,
+                limit,
+                history,
+                reconciliation_history_page_limit(max_history_pages),
+            )
+            .await?;
         let mut complete = sweep.complete;
 
         // Prepare time range filter
@@ -5342,11 +5369,20 @@ impl OKXHttpClient {
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<FillReport>> {
         Ok(self
-            .request_spread_fill_reports_scoped(account_id, instrument_id, start, end, limit, None)
+            .request_spread_fill_reports_scoped(
+                account_id,
+                instrument_id,
+                start,
+                end,
+                limit,
+                None,
+                None,
+            )
             .await?
             .reports)
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn request_spread_fill_reports_scoped(
         &self,
         account_id: AccountId,
@@ -5355,6 +5391,7 @@ impl OKXHttpClient {
         end: Option<Timestamp>,
         limit: Option<u32>,
         scope: Option<ReportInstrumentScope<'_>>,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<ReportSweep<FillReport>> {
         let mut builder = GetSpreadTradesParamsBuilder::default();
 
@@ -5375,7 +5412,13 @@ impl OKXHttpClient {
         }
 
         let params = builder.build().map_err(|e| anyhow::anyhow!(e))?;
-        let sweep = self.paginate_spread_fills(&params, limit).await?;
+        let sweep = self
+            .paginate_spread_fills(
+                &params,
+                limit,
+                reconciliation_history_page_limit(max_history_pages),
+            )
+            .await?;
         let mut complete = sweep.complete;
 
         let start_ns = start.map(UnixNanos::from);
@@ -5453,12 +5496,13 @@ impl OKXHttpClient {
         &self,
         base: &GetSpreadTradesParams,
         limit: Option<u32>,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXSpreadTrade>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.end_id = cursor.take();
 
@@ -5487,7 +5531,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Spread fill pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Spread fill pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -6607,12 +6651,17 @@ impl OKXHttpClient {
 
     /// Places an algo order using domain types.
     ///
-    /// This is a convenience method that accepts Nautilus domain types
-    /// and builds the appropriate OKX request structure internally.
+    /// Spot `StopMarket` and `MarketIfTouched` buys use `conditional` orders with explicit
+    /// base (`quote_quantity=false`) or quote (`true`) sizing. Spot trailing buys require
+    /// quote sizing. Other algo orders require base size or derivative contracts.
+    /// Cash-spot triggers support last price only; cross/isolated feeds depend on the account mode
+    /// and algo type.
+    /// Trailing orders reject mark/index feeds.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails.
+    /// Returns an error if the quantity denomination or trigger feed is unsupported,
+    /// required trigger terms are missing, or the request fails.
     #[expect(clippy::too_many_arguments)]
     pub async fn place_algo_order_with_domain_types(
         &self,
@@ -6622,6 +6671,7 @@ impl OKXHttpClient {
         order_side: OrderSide,
         order_type: OrderType,
         quantity: Quantity,
+        quote_quantity: bool,
         trigger_price: Option<Price>,
         trigger_type: Option<TriggerType>,
         limit_price: Option<Price>,
@@ -6640,10 +6690,32 @@ impl OKXHttpClient {
 
         let okx_side = OKXSide::from(order_side);
 
-        // Map trigger type to OKX format
+        let instrument_type = okx_instrument_type_from_symbol(instrument_id.symbol.as_str());
+
+        let tgt_ccy = okx_algo_target_currency(
+            instrument_type,
+            td_mode,
+            order_side,
+            order_type,
+            quote_quantity,
+        )
+        .map_err(OKXHttpError::from_order_denial)?;
+
+        validate_algo_trigger_type(instrument_type, td_mode, order_type, trigger_type)
+            .map_err(OKXHttpError::ValidationError)?;
+
+        let ccy = if instrument_type == OKXInstrumentType::Spot && td_mode != OKXTradeMode::Cash {
+            let (_, quote) = parse_base_quote_from_symbol(instrument_id.symbol.as_str())
+                .map_err(|e| OKXHttpError::ValidationError(e.to_string()))?;
+            Some(quote.to_string())
+        } else {
+            None
+        };
+
         let trigger_px_type_enum = trigger_type.map_or(OKXTriggerType::Last, Into::into);
 
         let uses_close_fraction = close_fraction.is_some();
+
         let (
             algo_type,
             sz,
@@ -6658,7 +6730,7 @@ impl OKXHttpClient {
             tp_trigger_px_type,
             pos_side,
             reduce_only,
-        ) = if uses_close_fraction {
+        ) = if uses_close_fraction || tgt_ccy.is_some() {
             if order_type == OrderType::TrailingStopMarket {
                 return Err(OKXHttpError::ValidationError(
                     "OKX close_fraction does not support TrailingStopMarket".to_string(),
@@ -6667,7 +6739,7 @@ impl OKXHttpClient {
 
             let trigger_px = trigger_price.map(|p| p.to_string()).ok_or_else(|| {
                 OKXHttpError::ValidationError(
-                    "OKX close_fraction orders require trigger_price".to_string(),
+                    "OKX conditional orders require trigger_price".to_string(),
                 )
             })?;
 
@@ -6715,7 +6787,7 @@ impl OKXHttpClient {
 
             (
                 OKXAlgoOrderType::Conditional,
-                None,
+                (!uses_close_fraction).then(|| quantity.to_string()),
                 None,
                 None,
                 None,
@@ -6725,8 +6797,16 @@ impl OKXHttpClient {
                 tp_trigger_px,
                 tp_ord_px,
                 tp_trigger_px_type,
-                Some(position_side.map_or(OKXPositionSide::Net, Into::into)),
-                Some(true),
+                if uses_close_fraction {
+                    Some(position_side.map_or(OKXPositionSide::Net, Into::into))
+                } else {
+                    position_side.map(Into::into)
+                },
+                if uses_close_fraction {
+                    Some(true)
+                } else {
+                    reduce_only
+                },
             )
         } else {
             let algo_type = conditional_order_to_algo_type(order_type)
@@ -6760,7 +6840,7 @@ impl OKXHttpClient {
 
         let reduce_only = if position_side.is_some() {
             okx_reduce_only_wire_value(
-                okx_instrument_type_from_symbol(instrument_id.symbol.as_str()),
+                instrument_type,
                 td_mode,
                 order_side,
                 position_side,
@@ -6788,7 +6868,7 @@ impl OKXHttpClient {
             tp_trigger_px,
             tp_ord_px,
             tp_trigger_px_type,
-            tgt_ccy: None,
+            tgt_ccy,
             pos_side,
             close_position: None,
             tag: Some(OKX_NAUTILUS_BROKER_ID.to_string()),
@@ -6797,6 +6877,7 @@ impl OKXHttpClient {
             callback_ratio,
             callback_spread,
             active_px: activation_price.map(|p| p.to_string()),
+            ccy,
         };
 
         self.place_algo_order(request).await
@@ -6853,6 +6934,7 @@ impl OKXHttpClient {
                 None,
                 None,
                 false,
+                None,
             )
             .await?
             .reports)
@@ -6871,6 +6953,7 @@ impl OKXHttpClient {
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         require_complete_active_coverage: bool,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<AlgoOrderReportSweep> {
         let mut instruments_cache: AHashMap<Ustr, InstrumentAny> = AHashMap::new();
         let mut ambiguous_triggered_child_ids = AHashSet::new();
@@ -7066,8 +7149,14 @@ impl OKXHttpClient {
             for history_state in history_states {
                 params.state = Some(*history_state);
                 let remaining = limit.map(|l| (l as usize).saturating_sub(reports.len()));
+
                 let history_sweep = match self
-                    .paginate_algo_history(&params, remaining, require_complete_active_coverage)
+                    .paginate_algo_history(
+                        &params,
+                        remaining,
+                        require_complete_active_coverage,
+                        reconciliation_history_page_limit(max_history_pages),
+                    )
                     .await
                 {
                     Ok(sweep) => sweep,
@@ -7508,4 +7597,10 @@ fn parse_http_algo_order(
     };
 
     parse_algo_order_status_report(&msg, instrument, account_id, ts_init)
+}
+
+fn reconciliation_history_page_limit(max_pages: Option<u32>) -> usize {
+    max_pages.map_or(MAX_RECONCILIATION_PAGES, |pages| {
+        (pages as usize).min(MAX_RECONCILIATION_PAGES)
+    })
 }

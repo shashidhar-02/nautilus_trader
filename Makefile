@@ -17,6 +17,7 @@ CARGO_LLVM_COV_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-llvm-
 CARGO_MACHETE_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-machete)
 CARGO_NEXTEST_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-nextest)
 CARGO_VET_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-vet)
+RUST_CODE_ANALYSIS_VERSION := $(shell bash scripts/cargo-tool-version.sh rust-code-analysis-cli)
 CBINDGEN_VERSION := $(shell bash scripts/cargo-tool-version.sh cbindgen)
 FLAMEGRAPH_VERSION := $(shell bash scripts/cargo-tool-version.sh flamegraph)
 LYCHEE_VERSION := $(shell bash scripts/cargo-tool-version.sh lychee)
@@ -210,6 +211,9 @@ SIM_FILTERSET := package(nautilus-common) + package(nautilus-event-store) + \
 	package(nautilus-execution) + \
 	(package(nautilus-live) & test(test_startup_reconciliation_times_out_waiting_for_mass_status)) + \
 	(package(nautilus-live) & test(~task::tests)) + \
+	(package(nautilus-live) & test(test_bulk_report_acceptance)) + \
+	(package(nautilus-live) & test(test_position_report_acceptance)) + \
+	(package(nautilus-live) & (test(test_targeted_report_acceptance) | test(test_targeted_collection))) + \
 	(package(nautilus-core) & test(~virtual_time))
 SIM_HIGH_PRECISION_PACKAGES := -p nautilus-common -p nautilus-execution
 
@@ -256,6 +260,12 @@ NEXTEST_ENV_TARGETS := cargo-test cargo-test-extras cargo-test-postgres-ci cargo
 
 ifneq ($(strip $(CARGO_BUILD_JOBS_FOR_RUST)),)
 $(CARGO_BUILD_JOB_TARGETS): export CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS_FOR_RUST)
+ifeq ($(origin CARGO_BUILD_JOBS),undefined)
+check-features check-features-defi: export CARGO_BUILD_JOBS := $(shell \
+	n='$(CARGO_BUILD_JOBS_FOR_RUST)'; \
+	[ "$$n" -gt 16 ] && n=16; \
+	printf '%s' "$$n")
+endif
 endif
 
 ifneq ($(strip $(NEXTEST_TEST_THREADS_FOR_RUST)),)
@@ -275,13 +285,13 @@ ADAPTER_CRATES := nautilus-architect-ax nautilus-betfair nautilus-binance \
     nautilus-blockchain nautilus-bybit nautilus-cli \
     nautilus-coinapi nautilus-coinbase nautilus-databento nautilus-deribit nautilus-derive \
     nautilus-dydx nautilus-hyperliquid nautilus-interactive-brokers \
-    nautilus-kraken nautilus-lighter nautilus-okx nautilus-polymarket \
+    nautilus-kraken nautilus-lighter nautilus-okx nautilus-polymarket nautilus-pyo3 \
     nautilus-sandbox nautilus-tardis
 
 # Workspace members without Rust test functions:
-# nautilus-trader is the container library, nautilus-pyo3 owns generated bindings,
-# and nautilus-tutorials has a binary target with test = false.
-NO_TEST_CRATES := nautilus-trader nautilus-pyo3 nautilus-tutorials
+# nautilus-trader is the container library, and nautilus-tutorials has a binary
+# target with test = false.
+NO_TEST_CRATES := nautilus-trader nautilus-tutorials
 
 # > Colors
 # Use ANSI escape codes directly for cross-platform compatibility (Git Bash on Windows doesn't have tput)
@@ -308,7 +318,7 @@ sync:  #-- Sync Python dependencies without building the package
 	fi
 	@found="$$(uv --version 2>/dev/null | awk '{print $$2}' || true)"; \
 	if [ -z "$$found" ]; then \
-		printf "$(RED)ERROR: uv not found, $(UV_REQUIRED_SPEC) required; run \`make update-uv\` to install $(UV_VERSION).$(RESET)\n"; \
+		printf "$(RED)ERROR: uv not found, $(UV_REQUIRED_SPEC) required; run \`make install-uv\` to install $(UV_VERSION).$(RESET)\n"; \
 		exit 1; \
 	fi
 	$(info $(M) Syncing Python dependencies...)
@@ -432,7 +442,9 @@ format:  #-- Format Rust (with nightly) and Python code
 .PHONY: pre-commit
 pre-commit: check-cargo-cooldown  #-- Run all pre-commit hooks on all files
 	@$(timer_start) \
-		prek run --all-files \
+		CHANGED_BASE_SHA="$${CHANGED_BASE_SHA:-origin/develop}" \
+			bash .pre-commit-hooks/check_formatting_rs.sh \
+		&& prek run --all-files \
 	$(call timer_end,Pre-commit)
 
 # The check-code target uses CARGO_FEATURES which is controlled by the HYPERSYNC flag.
@@ -538,12 +550,20 @@ clippy-strict-audit: check-cargo-cooldown  #-- Report candidate strict Clippy li
 		--profile "$(CARGO_CI_PROFILE)"
 
 .PHONY: clippy-pedantic-crate-%
-clippy-pedantic-crate-%: check-cargo-cooldown  #-- Audit pedantic and panic-prone lints for one crate (usage: make clippy-pedantic-crate-<crate_name>)
+clippy-pedantic-crate-%: check-cargo-cooldown check-clippy-allowances  #-- Audit pedantic and panic-prone lints for one crate (usage: make clippy-pedantic-crate-<crate_name>)
+	@allowances="$$(python3 -B scripts/update-clippy-allowances.py --flags)" && \
 	cargo clippy --locked --all-targets --all-features -p $* -- -D warnings \
 		-W clippy::pedantic \
 		-W clippy::todo \
 		-W clippy::unwrap_used \
-		-W clippy::expect_used
+		-W clippy::expect_used $$allowances
+
+.PHONY: check-clippy-allowances
+check-clippy-allowances:  #-- Check generated workspace allowances after source pedantic opt-ins
+	python3 -B scripts/update-clippy-allowances.py --check
+
+check-code check-code-standard-precision check-code-sim check-all-targets \
+	clippy clippy-fix clippy-fix-nightly clippy-strict-audit: check-clippy-allowances
 
 .PHONY: hawk
 hawk: check-cargo-cooldown check-hawk-installed  #-- Find unnecessary Rust public surface and restricted visibility
@@ -578,12 +598,12 @@ outdated: check-edit-installed  #-- Check for outdated dependencies
 	[ $$outdated_count -eq 0 ] && printf "$(GREEN)  All tools up to date ✓$(RESET)\n"
 
 .PHONY: update
-update: cargo-update update-uv  #-- Update all dependencies (cargo and uv)
+update: cargo-update install-uv  #-- Update all dependencies (cargo and uv)
 	$Q cd python && VIRTUAL_ENV= uv lock --upgrade
 	$Q $(MAKE) --no-print-directory socket-scan
 
-.PHONY: update-uv
-update-uv:  #-- Install or upgrade uv to the version pinned in the shared tool catalog
+.PHONY: install-uv
+install-uv:  #-- Install or upgrade uv to the version pinned in the shared tool catalog
 	$(info $(M) Ensuring uv $(UV_VERSION) is installed...)
 	@if [ "$$(uv --version 2>/dev/null | awk '{print $$2}')" = "$(UV_VERSION)" ]; then \
 		printf "$(GREEN)uv $(UV_VERSION) already installed$(RESET)\n"; \
@@ -592,7 +612,7 @@ update-uv:  #-- Install or upgrade uv to the version pinned in the shared tool c
 	fi
 
 .PHONY: install-tools
-install-tools: check-binstall-installed update-uv  #-- Install required development tools at shared and local pinned versions
+install-tools: check-binstall-installed install-uv  #-- Install required development tools at shared and local pinned versions
 	bash scripts/install-security-tools.sh \
 	&& cargo install cargo-codspeed --version $(CARGO_CODSPEED_VERSION) --locked \
 	&& cargo install cargo-edit --version $(CARGO_EDIT_VERSION) --locked \
@@ -604,6 +624,7 @@ install-tools: check-binstall-installed update-uv  #-- Install required developm
 	&& cargo install cbindgen --version $(CBINDGEN_VERSION) --locked \
 	&& cargo install flamegraph --version $(FLAMEGRAPH_VERSION) --locked \
 	&& cargo install lychee --version $(LYCHEE_VERSION) --locked \
+	&& cargo install rust-code-analysis-cli --version $(RUST_CODE_ANALYSIS_VERSION) --locked \
 	&& cargo install tokei --version $(TOKEI_VERSION) --locked \
 	&& cargo binstall prek --version $(PREK_VERSION) --no-confirm --locked
 
@@ -896,6 +917,7 @@ test-scripts:  #-- Run repository script tests
 	$Q bash scripts/ci/test-check-workspace-test-coverage.bash
 	$Q bash scripts/ci/test-configure-r2-aws.bash
 	$Q bash scripts/ci/test-docker-workflow-scripts.bash
+	$Q bash scripts/ci/test-download-artifact-wheel.bash
 	$Q bash scripts/ci/test-nightly-merge-workflow.bash
 	$Q bash scripts/ci/test-package-cli-artifact.bash
 	$Q bash scripts/ci/test-plan.bash
@@ -910,7 +932,10 @@ test-scripts:  #-- Run repository script tests
 	$Q bash scripts/ci/test-validate-wheel-upload.bash
 	$Q bash scripts/ci/test-verify-published-registries-crates.bash
 	$Q bash scripts/test-check-cargo-cooldown.bash
+	$Q bash scripts/test-cargo-ci-benches.bash
 	$Q bash scripts/test-clippy-strict-audit.bash
+	$Q python3 -B scripts/test-security-audit.py
+	$Q python3 -B scripts/ci/test_clippy_allowances.py
 	$Q bash scripts/test-update-cargo-dependencies.bash
 	$Q python3 -B scripts/ci/test_check_commit_message.py
 	$Q python3 -B scripts/ci/test_check_test_network.py
@@ -1284,7 +1309,7 @@ CODSPEED_BENCH_TARGETS := \
 	f64_vs_decimal_to_price_quantity money_criterion price_criterion quantity_criterion \
 	expressions_criterion order_fills_criterion position_replay_criterion \
 	cache_orders cache_query_sets cache_xrate client_order_id order_list_id position_id matching \
-	msgbus mstr throttler matching_core
+	msgbus mstr throttler
 CODSPEED_BENCH_ARGS := $(addprefix --package ,$(CODSPEED_BENCH_CRATES)) \
 	$(addprefix --bench ,$(CODSPEED_BENCH_TARGETS))
 
@@ -1300,7 +1325,8 @@ CODSPEED_BENCH_ARGS := $(addprefix --package ,$(CODSPEED_BENCH_CRATES)) \
 cargo-ci-benches: check-cargo-cooldown  #-- Run Rust benches for the crates included in the CI performance workflow
 	@for crate in $(CI_BENCH_CRATES); do \
 	  echo "Running benches for $$crate"; \
-	  cargo bench --locked -p $$crate --profile bench --benches --no-fail-fast; \
+	  VALGRIND_OPTS="$${VALGRIND_OPTS:+$$VALGRIND_OPTS }--cachegrind:cache-sim=yes" \
+	  cargo bench --locked -p $$crate --profile bench --benches --no-fail-fast || exit $$?; \
 	done
 
 .PHONY: cargo-codspeed-build
@@ -1353,9 +1379,11 @@ init-services:  #-- Initialize development services eg. for integration tests (s
 .PHONY: start-services
 start-services:  #-- Start development services (without reinitializing database)
 	$(info $(M) Starting development services...)
-	bash scripts/ci/docker-pull-retry.sh public.ecr.aws/docker/library/postgres
-	bash scripts/ci/docker-pull-retry.sh dpage/pgadmin4
-	bash scripts/ci/docker-pull-retry.sh public.ecr.aws/docker/library/redis
+	@set -e; \
+	images=$$(docker compose -f .docker/docker-compose.yml config --images); \
+	for image in $$images; do \
+		bash scripts/ci/docker-pull-retry.sh "$$image"; \
+	done
 	docker compose -f .docker/docker-compose.yml up -d
 
 .PHONY: stop-services

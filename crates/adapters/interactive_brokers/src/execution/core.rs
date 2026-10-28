@@ -123,8 +123,6 @@ pub(super) const DENIAL_CLIENT_NOT_READY: &str = "IB_CLIENT_NOT_READY";
 pub(super) const DENIAL_ORDER_INVALID: &str = "ORDER_INVALID";
 pub(super) const DENIAL_ORDER_LIST_INVALID: &str = "ORDER_LIST_INVALID";
 pub(super) const DENIAL_ORDER_LIST_SIBLING_SUBMIT_FAILED: &str = "ORDER_LIST_SIBLING_SUBMIT_FAILED";
-pub(super) const DENIAL_POST_ONLY_UNSUPPORTED: &str = "UNSUPPORTED_POST_ONLY";
-pub(super) const DENIAL_QUOTE_QUANTITY_UNSUPPORTED: &str = "UNSUPPORTED_QUOTE_QUANTITY";
 pub(super) const DENIAL_TRAILING_OFFSET_TYPE_UNSUPPORTED: &str = "UNSUPPORTED_TRAILING_OFFSET_TYPE";
 const ORDER_ID_PARTITION_SIZE: i32 = 1_000_000;
 
@@ -447,6 +445,8 @@ impl InteractiveBrokersExecutionClient {
         config: InteractiveBrokersExecutionClientConfig,
         instrument_provider: Arc<InteractiveBrokersInstrumentProvider>,
     ) -> anyhow::Result<Self> {
+        config.validate()?;
+
         anyhow::ensure!(
             !config.client_id.unsigned_abs().is_multiple_of(1000),
             "Interactive Brokers execution client_id must not be a multiple of 1000 because order ID partitioning uses client_id % 1000, was {}",
@@ -603,6 +603,7 @@ impl InteractiveBrokersExecutionClient {
         cmd: SubmitOrderList,
         orders: Vec<OrderAny>,
     ) -> anyhow::Result<()> {
+        self.seed_instruments_from_cache(orders.iter().map(|order| order.instrument_id()));
         let client = self.ib_client.as_ref().context("IB client not connected")?;
         self.seed_price_magnifiers_from_cache(orders.iter().map(OrderAny::instrument_id));
 
@@ -1047,6 +1048,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             return Ok(());
         }
 
+        self.seed_instruments_from_cache([cmd.instrument_id]);
         self.seed_price_magnifiers_from_cache([cmd.instrument_id]);
 
         let client = self.ib_client.as_ref().context("IB client not connected")?;
@@ -1137,6 +1139,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             self.config.port,
             self.config.client_id,
             self.config.connection_timeout,
+            self.config.max_reconnect_attempts,
         )
         .await
         .context("Failed to connect to IB Gateway/TWS")?;
@@ -1893,6 +1896,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             return Ok(());
         }
 
+        self.seed_instruments_from_cache([cmd.instrument_id]);
         self.seed_price_magnifiers_from_cache([cmd.instrument_id]);
 
         let client = self.ib_client.as_ref().context("IB client not connected")?;

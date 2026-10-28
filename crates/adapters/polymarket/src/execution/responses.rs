@@ -56,7 +56,7 @@ use crate::{
 };
 
 #[expect(clippy::too_many_arguments)]
-pub(super) async fn handle_batch_order_responses(
+pub(super) fn handle_batch_order_responses(
     responses: Vec<OrderResponse>,
     batch_orders: Vec<BatchLimitOrderContext>,
     expected_venue_order_ids: Vec<VenueOrderId>,
@@ -70,7 +70,7 @@ pub(super) async fn handle_batch_order_responses(
     pending_submits: &PendingSubmitTracker,
     pending_cancels: &PendingCancelTracker,
     account_id: AccountId,
-) {
+) -> impl Future<Output = ()> + Send + 'static {
     let response_len = responses.len();
     let order_len = batch_orders.len();
 
@@ -81,11 +81,10 @@ pub(super) async fn handle_batch_order_responses(
     }
 
     let mut follow_ups = Vec::new();
+    let mut batch_orders = batch_orders.into_iter().zip(expected_venue_order_ids);
 
-    for ((batch_order, response), expected_venue_order_id) in batch_orders
-        .iter()
-        .zip(responses)
-        .zip(&expected_venue_order_ids)
+    for (response, (batch_order, expected_venue_order_id)) in
+        responses.into_iter().zip(batch_orders.by_ref())
     {
         let time_in_force = batch_order.order.time_in_force();
         let (deferred_cancel, fok_order_id) = if submit_response_outcome(&response, time_in_force)
@@ -94,8 +93,8 @@ pub(super) async fn handle_batch_order_responses(
             (
                 handle_unknown_submit_result(
                     &batch_order.order,
-                    *expected_venue_order_id,
-                    &submit_response_unknown_reason(&response, false, *expected_venue_order_id),
+                    expected_venue_order_id,
+                    &submit_response_unknown_reason(&response, false, expected_venue_order_id),
                     None,
                     emitter,
                     clock,
@@ -115,7 +114,7 @@ pub(super) async fn handle_batch_order_responses(
             let deferred_cancel = handle_order_response(
                 Ok(response),
                 &batch_order.order,
-                *expected_venue_order_id,
+                expected_venue_order_id,
                 emitter,
                 clock,
                 fill_tracker,
@@ -135,11 +134,7 @@ pub(super) async fn handle_batch_order_responses(
         }
     }
 
-    for (batch_order, expected_venue_order_id) in batch_orders
-        .iter()
-        .zip(expected_venue_order_ids)
-        .skip(response_len)
-    {
+    for (batch_order, expected_venue_order_id) in batch_orders {
         let deferred_cancel = handle_unknown_submit_result(
             &batch_order.order,
             expected_venue_order_id,
@@ -204,7 +199,11 @@ pub(super) async fn handle_batch_order_responses(
                 }
             }
         });
-    join_all(follow_ups).await;
+
+    let follow_ups = join_all(follow_ups);
+    async move {
+        follow_ups.await;
+    }
 }
 
 pub(super) fn reject_submit_order(
@@ -223,7 +222,7 @@ pub(super) fn reject_submit_order(
 }
 
 #[expect(clippy::too_many_arguments)]
-pub(super) fn emit_market_order_submitted(
+pub(super) fn emit_market_order_quantity_update(
     order: &mut OrderAny,
     is_quote_qty: bool,
     side: OrderSide,
@@ -234,8 +233,6 @@ pub(super) fn emit_market_order_submitted(
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
 ) {
-    emitter.emit_order_submitted(order);
-
     if !update_quantity || expected_base_qty.is_zero() {
         return;
     }
@@ -1197,7 +1194,7 @@ fn handle_fok_rest_status(
 #[cfg(test)]
 mod tests {
     use nautilus_common::messages::{ExecutionEvent, ExecutionReport};
-    use nautilus_core::{UnixNanos, collections::AtomicMap};
+    use nautilus_core::{Params, UnixNanos, collections::AtomicMap};
     use nautilus_model::{
         enums::{AccountType, LiquiditySide, OrderSide},
         events::{OrderCanceled, order::spec::OrderFillVoidedSpec},
@@ -1269,7 +1266,8 @@ mod tests {
         let InstrumentAny::BinaryOption(binary) = instrument else {
             panic!("expected binary option test instrument");
         };
-        let mut info = binary.info.take().unwrap_or_default();
+
+        let mut info = binary.info.as_deref().cloned().unwrap_or_default();
         info.insert(
             "fee_schedule".into(),
             serde_json::json!({
@@ -1279,7 +1277,7 @@ mod tests {
                 "rebateRate": "0",
             }),
         );
-        binary.info = Some(info);
+        binary.info = Some(Params::new(info));
     }
 
     fn bind_instrument_to_trade(
@@ -2574,7 +2572,8 @@ mod tests {
         let order_contexts = OrderContextRegistry::default();
         let pending_cancels = PendingCancelTracker::default();
 
-        emit_market_order_submitted(
+        emitter.emit_order_submitted(&order);
+        emit_market_order_quantity_update(
             &mut order,
             false,
             OrderSide::Sell,
@@ -3000,7 +2999,7 @@ mod tests {
         assert_eq!(scoped_reports.len(), 1);
         assert_eq!(scoped_reports[0].venue_order_id, scoped_venue_order_id);
         assert_eq!(scoped_reports[0].instrument_id, instrument_id);
-        assert_eq!(scoped_reports[0].last_qty.as_decimal(), Decimal::from(25));
+        assert_eq!(scoped_reports[0].last_qty.as_decimal(), Decimal::from(20));
         assert_eq!(
             scoped_discards,
             crate::execution::reconciliation::FillBuildDiscards::default()
@@ -3162,7 +3161,8 @@ mod tests {
         fill.order_side = OrderSide::Sell;
         fill_tracker.buffer_fill_for_test(venue_order_id, fill);
 
-        emit_market_order_submitted(
+        emitter.emit_order_submitted(&order);
+        emit_market_order_quantity_update(
             &mut order,
             true,
             OrderSide::Buy,
@@ -3265,7 +3265,8 @@ mod tests {
             .unwrap();
 
         let (emitter, mut receiver) = test_emitter();
-        emit_market_order_submitted(
+        emitter.emit_order_submitted(&order);
+        emit_market_order_quantity_update(
             &mut order,
             true,
             OrderSide::Buy,
@@ -3695,7 +3696,8 @@ mod tests {
             .unwrap();
 
         let (emitter, mut receiver) = test_emitter();
-        emit_market_order_submitted(
+        emitter.emit_order_submitted(&order);
+        emit_market_order_quantity_update(
             &mut order,
             true,
             OrderSide::Buy,

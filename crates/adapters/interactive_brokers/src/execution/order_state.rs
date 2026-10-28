@@ -229,6 +229,21 @@ impl InteractiveBrokersExecutionClient {
         instrument_ids
     }
 
+    // Instruments the data client loads at runtime reach the cache but not this provider,
+    // so seed them before an order on one resolves its contract or its updates
+    pub(super) fn seed_instruments_from_cache(
+        &self,
+        instrument_ids: impl IntoIterator<Item = InstrumentId>,
+    ) {
+        let cache = self.core.cache();
+        let instruments: Vec<_> = instrument_ids
+            .into_iter()
+            .filter(|instrument_id| self.instrument_provider.find(instrument_id).is_none())
+            .filter_map(|instrument_id| cache.instrument(&instrument_id).cloned())
+            .collect();
+        self.instrument_provider.add_cached_instruments(instruments);
+    }
+
     pub(super) async fn preload_cached_instruments(&self, client: &Client) {
         let instrument_ids = {
             let cache = self.core.cache();
@@ -360,7 +375,7 @@ impl InteractiveBrokersExecutionClient {
             .chain(std::iter::once(spread))
         {
             if self.core.cache().instrument(&instrument.id()).is_none()
-                && let Err(e) = data_sender.send(DataEvent::Instrument(instrument))
+                && let Err(e) = data_sender.send(DataEvent::Data(instrument.into()))
             {
                 tracing::warn!("Failed to publish IB spread instrument: {e}");
             }
@@ -405,7 +420,7 @@ impl InteractiveBrokersExecutionClient {
                 continue;
             }
 
-            if let Err(e) = data_sender.send(DataEvent::Instrument(instrument)) {
+            if let Err(e) = data_sender.send(DataEvent::Data(instrument.into())) {
                 tracing::warn!("Failed to publish IB position instrument: {e}");
             }
         }
@@ -754,8 +769,8 @@ mod tests {
     #[rstest]
     fn test_contract_with_order_exchange_param_overrides_exchange() {
         let contract = contract_with_exchange("SMART");
-        let mut params = Params::new();
-        params.insert("exchange".to_string(), Value::String("IEX".to_string()));
+        let params =
+            Params::new([("exchange".to_string(), Value::String("IEX".to_string()))].into());
 
         let updated = InteractiveBrokersExecutionClient::contract_with_order_exchange_param(
             contract.clone(),
@@ -770,7 +785,7 @@ mod tests {
     #[rstest]
     fn test_contract_with_order_exchange_param_keeps_contract_without_exchange() {
         let contract = contract_with_exchange("SMART");
-        let params = Params::new();
+        let params = Params::empty();
 
         let updated = InteractiveBrokersExecutionClient::contract_with_order_exchange_param(
             contract,
@@ -784,8 +799,7 @@ mod tests {
     #[rstest]
     fn test_contract_with_order_exchange_param_keeps_contract_with_empty_exchange() {
         let contract = contract_with_exchange("SMART");
-        let mut params = Params::new();
-        params.insert("exchange".to_string(), Value::String(String::new()));
+        let params = Params::new([("exchange".to_string(), Value::String(String::new()))].into());
 
         let updated = InteractiveBrokersExecutionClient::contract_with_order_exchange_param(
             contract,
@@ -799,8 +813,7 @@ mod tests {
     #[rstest]
     fn test_contract_with_order_exchange_param_rejects_non_string_exchange() {
         let contract = contract_with_exchange("SMART");
-        let mut params = Params::new();
-        params.insert("exchange".to_string(), Value::Bool(true));
+        let params = Params::new([("exchange".to_string(), Value::Bool(true))].into());
 
         let err = InteractiveBrokersExecutionClient::contract_with_order_exchange_param(
             contract,

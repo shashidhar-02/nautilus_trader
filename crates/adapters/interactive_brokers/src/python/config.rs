@@ -17,6 +17,7 @@
 
 use std::str::FromStr;
 
+use nautilus_common::python::config_error_to_pyvalue_err;
 use nautilus_core::{python::to_pyvalue_err, string::secret::SecretString};
 use nautilus_model::{identifiers::InstrumentId, types::Currency};
 use pyo3::prelude::*;
@@ -50,7 +51,7 @@ fn validate_order_id_client_slot(client_id: i32) -> PyResult<()> {
 impl InteractiveBrokersDataClientConfig {
     /// Creates a new `InteractiveBrokersDataClientConfig` instance.
     #[new]
-    #[pyo3(signature = (host=None, port=None, client_id=None, use_regular_trading_hours=None, market_data_type=None, ignore_quote_tick_size_updates=None, connection_timeout=None, request_timeout=None, handle_revised_bars=None, batch_quotes=None, instrument_provider=None, dockerized_gateway=None, all_last_trades=None, subscription_idle_timeout_secs=None))]
+    #[pyo3(signature = (host=None, port=None, client_id=None, use_regular_trading_hours=None, market_data_type=None, ignore_quote_tick_size_updates=None, connection_timeout=None, request_timeout=None, handle_revised_bars=None, batch_quotes=None, instrument_provider=None, dockerized_gateway=None, all_last_trades=None, subscription_idle_timeout_secs=None, max_reconnect_attempts=None))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
         host: Option<String>,
@@ -67,6 +68,7 @@ impl InteractiveBrokersDataClientConfig {
         dockerized_gateway: Option<&DockerizedIBGatewayConfig>,
         all_last_trades: Option<bool>,
         subscription_idle_timeout_secs: Option<u64>,
+        max_reconnect_attempts: Option<u32>,
     ) -> PyResult<Self> {
         if dockerized_gateway.is_some() {
             return Err(to_pyvalue_err(
@@ -92,6 +94,7 @@ impl InteractiveBrokersDataClientConfig {
             batch_quotes: batch_quotes.unwrap_or(true),
             all_last_trades: all_last_trades.unwrap_or_else(|| Self::default().all_last_trades),
             subscription_idle_timeout_secs,
+            max_reconnect_attempts,
             instrument_provider: instrument_provider.unwrap_or_default(),
         };
 
@@ -171,6 +174,12 @@ impl InteractiveBrokersDataClientConfig {
         self.subscription_idle_timeout_secs
     }
 
+    /// Returns the optional bound on ibapi's automatic reconnect attempts.
+    #[getter]
+    fn max_reconnect_attempts(&self) -> Option<u32> {
+        self.max_reconnect_attempts
+    }
+
     /// Returns the instrument provider configuration.
     #[getter]
     fn instrument_provider(&self) -> InteractiveBrokersInstrumentProviderConfig {
@@ -192,7 +201,7 @@ impl InteractiveBrokersDataClientConfig {
 impl InteractiveBrokersExecutionClientConfig {
     /// Creates a new `InteractiveBrokersExecutionClientConfig` instance.
     #[new]
-    #[pyo3(signature = (host=None, port=None, client_id=None, account_id=None, connection_timeout=None, request_timeout=None, fetch_all_open_orders=None, track_option_exercise_from_position_update=None, instrument_provider=None, dockerized_gateway=None, base_currency=None))]
+    #[pyo3(signature = (host=None, port=None, client_id=None, account_id=None, connection_timeout=None, request_timeout=None, fetch_all_open_orders=None, track_option_exercise_from_position_update=None, instrument_provider=None, dockerized_gateway=None, base_currency=None, max_reconnect_attempts=None))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
         host: Option<String>,
@@ -206,6 +215,7 @@ impl InteractiveBrokersExecutionClientConfig {
         instrument_provider: Option<InteractiveBrokersInstrumentProviderConfig>,
         dockerized_gateway: Option<&DockerizedIBGatewayConfig>,
         base_currency: Option<Currency>,
+        max_reconnect_attempts: Option<u32>,
     ) -> PyResult<Self> {
         if dockerized_gateway.is_some() {
             return Err(to_pyvalue_err(
@@ -219,7 +229,7 @@ impl InteractiveBrokersExecutionClientConfig {
         validate_order_id_client_slot(client_id)?;
         let request_timeout = request_timeout.unwrap_or(60);
 
-        Ok(Self {
+        let config = Self {
             host,
             port,
             client_id,
@@ -230,8 +240,12 @@ impl InteractiveBrokersExecutionClientConfig {
             fetch_all_open_orders: fetch_all_open_orders.unwrap_or(false),
             track_option_exercise_from_position_update: track_option_exercise_from_position_update
                 .unwrap_or(false),
+            max_reconnect_attempts,
             instrument_provider: instrument_provider.unwrap_or_default(),
-        })
+        };
+
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
     }
 
     /// Returns the host.
@@ -288,6 +302,12 @@ impl InteractiveBrokersExecutionClientConfig {
         self.track_option_exercise_from_position_update
     }
 
+    /// Returns the optional bound on ibapi's automatic reconnect attempts.
+    #[getter]
+    fn max_reconnect_attempts(&self) -> Option<u32> {
+        self.max_reconnect_attempts
+    }
+
     /// Returns the instrument provider configuration.
     #[getter]
     fn instrument_provider(&self) -> InteractiveBrokersInstrumentProviderConfig {
@@ -327,7 +347,7 @@ impl InteractiveBrokersInstrumentProviderConfig {
         filter_callable: Option<String>,
         cache_path: Option<String>,
     ) -> PyResult<Self> {
-        Ok(Self {
+        let config = Self {
             symbology_method: symbology_method.unwrap_or_default(),
             load_ids: load_ids.unwrap_or_default(),
             load_contracts: if let Some(c) = load_contracts {
@@ -359,7 +379,10 @@ impl InteractiveBrokersInstrumentProviderConfig {
                 .collect::<PyResult<_>>()?,
             filter_callable,
             cache_path,
-        })
+        };
+
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
     }
 
     /// Returns the symbology method.

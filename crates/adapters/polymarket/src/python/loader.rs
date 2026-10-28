@@ -17,8 +17,10 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_core::{
+    Params,
     datetime::datetime_to_unix_nanos,
     python::{
         IntoPyObjectNautilusExt, params::value_to_pyobject, to_pyruntime_err, to_pyvalue_err,
@@ -40,6 +42,7 @@ use serde_json::{Value, json};
 
 use super::extract_string_map;
 use crate::{
+    common::parse::validate_market_version,
     http::{
         clob::PolymarketClobPublicClient,
         data_api::PolymarketDataApiHttpClient,
@@ -52,7 +55,7 @@ use crate::{
     providers::{build_gamma_event_params_from_hashmap, build_gamma_params_from_hashmap},
 };
 
-#[pyclass(name = "PolymarketDataLoader", skip_from_py_object)]
+#[pyclass(name = "PolymarketDataLoader")]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.polymarket")]
 #[derive(Clone, Debug)]
 pub struct PyPolymarketDataLoader {
@@ -455,6 +458,7 @@ async fn build_loader(
     clob: &PolymarketClobPublicClient,
     data_api_client: PolymarketDataApiHttpClient,
 ) -> PyResult<PyPolymarketDataLoader> {
+    validate_market_version(market.version.as_deref()).map_err(to_pyvalue_err)?;
     if market.condition_id.trim().is_empty() {
         return Err(to_pyvalue_err("Gamma market has an empty condition ID"));
     }
@@ -489,6 +493,8 @@ fn build_loader_from_details(
     token_index: usize,
     data_api_client: PolymarketDataApiHttpClient,
 ) -> PyResult<PyPolymarketDataLoader> {
+    validate_market_version(market.version.as_deref()).map_err(to_pyvalue_err)?;
+    validate_market_version(details.version.as_deref()).map_err(to_pyvalue_err)?;
     validate_market_details(details, &market.condition_id, token_index)?;
 
     market.clob_token_ids = serde_json::to_string(
@@ -523,9 +529,11 @@ fn build_loader_from_details(
         };
 
     // Fetched snapshots can reveal outcomes that were unknown during the historical period
-    if let Some(info) = instrument.info.as_mut() {
+    if let Some(info) = instrument.info.as_ref() {
+        let mut info = IndexMap::clone(info);
         info.shift_remove("gamma_market");
         info.shift_remove("gamma_event");
+        instrument.info = Some(Params::new(info));
     }
 
     let resolution_metadata = resolution_metadata(&market, details);
@@ -787,6 +795,7 @@ mod tests {
             "id": "100001",
             "conditionId": "0xcondition",
             "questionID": "0xquestion",
+            "version": "v1",
             "clobTokenIds": "[]",
             "outcomes": "[]",
             "question": "Will the test pass?",
@@ -829,6 +838,7 @@ mod tests {
 
     fn clob_market() -> ClobMarketResponse {
         serde_json::from_value(json!({
+            "version": "v1",
             "condition_id": "0xcondition",
             "closed": true,
             "tokens": [
@@ -1024,6 +1034,30 @@ mod tests {
         Python::initialize();
         Python::attach(|py| assert!(error.is_instance_of::<PyValueError>(py)));
         assert!(error.to_string().contains(message));
+    }
+
+    #[rstest]
+    #[case(Some("v2"))]
+    #[case(None)]
+    #[case(Some("unknown"))]
+    fn build_loader_rejects_unsupported_protocol(
+        #[case] version: Option<&str>,
+        #[values(false, true)] clob_unsupported: bool,
+    ) {
+        Python::initialize();
+        let mut market = gamma_market();
+        let mut details = clob_market();
+        if clob_unsupported {
+            details.version = version.map(str::to_string);
+        } else {
+            market.version = version.map(str::to_string);
+        }
+
+        let error = build_loader_from_details(market, &details, 0, data_api()).unwrap_err();
+        assert!(error.to_string().contains(&format!(
+            "Unsupported Polymarket market protocol {}; only v1 CTF markets are supported",
+            version.unwrap_or("missing"),
+        )));
     }
 
     #[rstest]
